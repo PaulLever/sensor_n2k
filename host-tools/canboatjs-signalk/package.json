@@ -1,0 +1,14 @@
+{
+  "name": "sensor-n2k-bridge",
+  "version": "1.0.0",
+  "description": "Zephyr SPI bridge → canboatjs → Signal K (single process, no vcan needed)",
+  "main": "bridge.js",
+  "scripts": {
+    "start": "sudo node bridge.js"
+  },
+  "dependencies": {
+    "@canboat/canboatjs": "^3.20.0",
+    "spi-device": "^3.0.0",
+    "ws": "^8.0.0"
+  }
+}

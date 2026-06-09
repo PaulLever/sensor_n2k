@@ -1,0 +1,17 @@
+/*
+ * Loopback test overlay: enable FDCAN1 and ADC, no 1-wire needed.
+ */
+
+/ {
+	chosen {
+		zephyr,canbus = &fdcan1;
+	};
+};
+
+&fdcan1 {
+	pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>;
+	pinctrl-names = "default";
+	bus-speed = <250000>;
+	bus-speed-data = <250000>;
+	status = "okay";
+};

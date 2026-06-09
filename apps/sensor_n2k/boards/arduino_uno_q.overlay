@@ -1,0 +1,47 @@
+/*
+ * Arduino UNO Q overlay for sensor_n2k.
+ *
+ * SPI3 (spi3) is the internal SPI bus to the Linux MPU — already enabled
+ * with correct pinctrl in arduino_uno_q-common.dtsi.  No changes needed.
+ *
+ * RDY output: PG13 = gpiochip1 line 70 on the Linux side.
+ *
+ * FDCAN1 RX/TX: PD0 / PD1
+ * 1-Wire data : PB4 (Arduino D8)
+ * ADC ch 9    : PA4 (Arduino A0)
+ */
+
+/ {
+	chosen {
+		zephyr,canbus = &fdcan1;
+	};
+
+	/* RDY GPIO — must use DT_PATH(zephyr_user) to match can_spi_bridge_n2k */
+	zephyr_user: zephyr,user {
+		rdy_gpios = <&gpiog 13 GPIO_ACTIVE_HIGH>;
+	};
+
+	/* 1-Wire bus on PB4 (D8). External 4.7 kΩ pull-up required. */
+	w1_0: onewire {
+		compatible = "zephyr,w1-gpio";
+		gpios = <&gpiob 4 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ds18b20_0: ds18b20@0 {
+			compatible = "maxim,ds18b20";
+			reg = <0>;
+			family-code = <0x28>;
+			resolution = <12>;
+		};
+	};
+};
+
+/* FDCAN1 250 kbit/s classic CAN for NMEA 2000 */
+&fdcan1 {
+	pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>;
+	pinctrl-names = "default";
+	bus-speed = <250000>;
+	bus-speed-data = <250000>;
+	status = "okay";
+};

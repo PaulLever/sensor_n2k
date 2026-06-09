@@ -1,0 +1,119 @@
+#ifndef N2K_H_
+#define N2K_H_
+
+#include <zephyr/drivers/can.h>
+#include <stdint.h>
+
+/* Source address this device claims on the N2K bus */
+#define N2K_SRC_ADDR   0x30U
+/* Default priority for environmental / engine PGNs */
+#define N2K_PRIORITY   6U
+
+/*
+ * PGN 130312 – Temperature (single frame, max ~382 °C).
+ * Use for 1-wire DS18B20 readings (range −55 … +125 °C).
+ */
+#define N2K_PGN_TEMP        130312UL
+
+/*
+ * PGN 130316 – Temperature, Extended Range (single frame, up to ~16 500 °C).
+ * Use for exhaust gas temperature (EGT) or other high-range measurements.
+ */
+#define N2K_PGN_TEMP_EXT    130316UL
+
+/* Temperature source codes (shared by PGN 130312 and 130316) */
+#define N2K_TSRC_SEA         0U
+#define N2K_TSRC_OUTSIDE     1U
+#define N2K_TSRC_INSIDE      2U
+#define N2K_TSRC_ENGINE_ROOM 3U
+#define N2K_TSRC_EGT        14U   /* Exhaust Gas Temperature */
+
+/**
+ * Start the CAN controller (must be called before any send).
+ * Returns 0 on success, negative errno on error.
+ */
+int n2k_init(const struct device *can_dev);
+
+/**
+ * PGN 130312 – Temperature (8 bytes, single CAN frame).
+ * @param temp_k  Temperature in Kelvin (clamped to uint16 × 0.01 K range).
+ */
+int n2k_send_temp(const struct device *can_dev,
+		  uint8_t instance, uint8_t source, float temp_k);
+
+/**
+ * PGN 130316 – Temperature Extended Range (8 bytes, single CAN frame).
+ * @param temp_k  Temperature in Kelvin, encoded as uint24 × 0.001 K.
+ */
+int n2k_send_temp_ext(const struct device *can_dev,
+		      uint8_t instance, uint8_t source, float temp_k);
+
+/** Build the 29-bit CAN ID for a PDU2 (broadcast) NMEA 2000 PGN. */
+uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src);
+
+/* ------------------------------------------------------------------ */
+/* ISO 11783-5 address management                                       */
+/* ------------------------------------------------------------------ */
+
+#define N2K_PGN_ISO_REQUEST      59904UL   /* 0xEA00 — request any PGN */
+#define N2K_PGN_ISO_ADDR_CLAIM   60928UL   /* 0xEE00 — address claim   */
+#define N2K_ADDR_NULL            0xFEU     /* cannot claim an address  */
+#define N2K_ADDR_GLOBAL          0xFFU     /* broadcast / no dest      */
+
+/*
+ * 64-bit device NAME (ISO 11783-5 §4.2).  Adjust the field constants to
+ * match the actual device class and manufacturer.
+ *
+ * Bit layout, MSB→LSB of the uint64_t:
+ *   [63]    Arbitrary Address Capable (1 = device can resolve conflicts)
+ *   [62:60] Industry Group            (4 = Marine)
+ *   [59:56] System Instance           (0)
+ *   [55:49] Device Class              (75 = Propulsion)
+ *   [48]    Reserved                  (0)
+ *   [47:40] Function                  (130 = Temperature Sensor)
+ *   [39:35] Function Instance         (0)
+ *   [34:32] ECU Instance              (0)
+ *   [31:21] Manufacturer Code         (0x7FF = proprietary/unregistered)
+ *   [20:0]  Identity Number           (unique per physical device, 21 bits)
+ */
+#define N2K_NAME_ARBITRARY_ADDR  1U
+#define N2K_NAME_INDUSTRY_GROUP  4U      /* Marine */
+#define N2K_NAME_SYS_INSTANCE    0U
+#define N2K_NAME_DEVICE_CLASS   75U      /* Propulsion */
+#define N2K_NAME_FUNCTION      130U      /* Temperature Sensor */
+#define N2K_NAME_FUNC_INSTANCE   0U
+#define N2K_NAME_ECU_INSTANCE    0U
+#define N2K_NAME_MANUFACTURER  0x7FFU   /* proprietary / unregistered */
+#define N2K_NAME_IDENTITY        1U      /* change per physical device */
+
+#define N2K_NAME ( \
+	((uint64_t)(N2K_NAME_ARBITRARY_ADDR & 0x01U)    << 63) | \
+	((uint64_t)(N2K_NAME_INDUSTRY_GROUP & 0x07U)    << 60) | \
+	((uint64_t)(N2K_NAME_SYS_INSTANCE   & 0x0FU)    << 56) | \
+	((uint64_t)(N2K_NAME_DEVICE_CLASS   & 0x7FU)    << 49) | \
+	((uint64_t)(N2K_NAME_FUNCTION       & 0xFFU)    << 40) | \
+	((uint64_t)(N2K_NAME_FUNC_INSTANCE  & 0x1FU)    << 35) | \
+	((uint64_t)(N2K_NAME_ECU_INSTANCE   & 0x07U)    << 32) | \
+	((uint64_t)(N2K_NAME_MANUFACTURER   & 0x7FFU)   << 21) | \
+	((uint64_t)(N2K_NAME_IDENTITY       & 0x1FFFFFUL)     ))
+
+/**
+ * Claim a source address on the NMEA 2000 bus (ISO 11783-5 §9.4).
+ *
+ * Sends PGN 60928, waits 250 ms for conflicts, and retries with the next
+ * available SA if another device with a lower NAME already holds this one.
+ * On success, starts a background thread that responds to ISO Requests
+ * (PGN 59904) and resolves any late address conflicts.
+ *
+ * Must be called after the CAN controller is started (i.e. after
+ * spi_bridge_init) and before any sensor frames are transmitted.
+ *
+ * Returns 0 on success, negative errno on error.
+ */
+int n2k_negotiate_address(const struct device *can_dev);
+
+/** Return the currently claimed SA (0x00–0xFD), or N2K_ADDR_NULL if
+ *  address claiming failed. */
+uint8_t n2k_sa_get(void);
+
+#endif /* N2K_H_ */
