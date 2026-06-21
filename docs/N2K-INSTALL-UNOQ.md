@@ -232,7 +232,7 @@ sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
 ```
 ######################################################################
 WSL — Build
-cp -r /mnt/d/svjeo/zephyrproject/zephyr/unoq ~/unoq-ws/zephyr/
+sudo cp -r /mnt/d/svjeo/zephyrproject/zephyr/unoq ~/unoq-ws/zephyr/
 scp -r ~/unoq-ws/zephyr/unoq/host-tools/canboatjs-signalk \
     arduino@192.168.87.35:/tmp/host-tools/
 
@@ -248,6 +248,8 @@ scp -r ~/unoq-ws/zephyr/unoq/openocd-flasher ${TARGET}:/tmp/oo && \
 scp -r ~/unoq-ws/zephyr/unoq/host-tools ${TARGET}:/tmp/host-tools
 
 SSH — Device prep (once per deploy)
+mkdir /tmp/host-tools       **before wsl copy
+
 sudo mkdir -p /home/root/zephyr-flash && \
 sudo cp -r /tmp/oo /home/root/zephyr-flash/oo && \
 sudo cp /tmp/zephyr.bin /home/root/zephyr-flash/zephyr.bin && \
@@ -263,6 +265,8 @@ sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
   -c "verify_image /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
   -c "reset run" -c shutdown && \
 kill $BOOT0 2>/dev/null
+
+
 
 SSH — Start Linux bridge (after flash)
 cd /tmp/host-tools/canboatjs-signalk
@@ -299,3 +303,77 @@ NAME fields to customise (all in n2k.h):
 - N2K_NAME_DEVICE_CLASS — 75 (Propulsion) is correct for an EGT sensor; change to 60 if it's a general environmental sensor.
 - N2K_NAME_MANUFACTURER — register a manufacturer code with NMEA for a real product.
 
+*************************************
+Step 1 — flash and leave OpenOCD open:
+sudo killall gpioset 2>/dev/null
+gpioset -c gpiochip1 37=0 & BOOT0=$!
+sleep 0.3
+sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg \
+  -c init -c halt \
+  -c "flash write_image erase /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
+  -c "verify_image /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
+  -c "reset run" &
+OOCD=$!
+sleep 2
+kill $BOOT0 2>/dev/null
+
+OpenOCD is now running in the background with the STM32 executing.
+
+Step 2 — attach RTT in a second terminal:
+telnet localhost 4444
+
+Then at the OpenOCD prompt:
+rtt setup 0x20000000 0xC0000 "SEGGER RTT"
+rtt start
+rtt server start 9090 0
+
+Step 3 — read the output in a third terminal:
+telnet localhost 9090
+
+You should immediately see the Zephyr boot banner and then all the LOG_INF/LOG_WRN/LOG_ERR messages including which CAN/SPI check is failing. The bus sniff result (Bus sniff: no traffic or N2K traffic detected) will be among the first lines after boot.
+*********************
+/dev/ttyS0 is it — that's the STM32 USART1 routed internally through the Linux MPU. Open a second terminal on the UNO Q and monitor it before you flash:
+
+stty -F /dev/ttyS0 115200 cs8 -cstopb -parenb -crtscts && cat /dev/ttyS0
+
+Then run your flash command in the first terminal. The moment reset run fires you should see the Zephyr boot banner in the monitoring terminal, followed by all the LOG output.
+
+Also note: the gpioset: Permission denied on gpiochip1 means BOOT0 isn't being held during flash, but it doesn't matter — OpenOCD controls the reset/halt directly over SWD and is flashing fine without it. You can strip that gpioset boilerplate from your flash command:
+
+sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg \
+  -c init -c halt \
+  -c "flash write_image erase /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
+  -c "verify_image /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
+  -c "reset run" -c shutdown
+  ********************************************8
+  Rebuild and copy the new zephyr.bin. Then on the UNO Q, replace your entire flash command with this single script — it flashes, keeps OpenOCD alive, starts RTT, and pipes the output straight to your terminal:
+
+sudo killall openocd 2>/dev/null
+sleep 1
+sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg \
+  -c "init" -c "halt" \
+  -c "flash write_image erase /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
+  -c "verify_image /home/root/zephyr-flash/zephyr.bin 0x08000000 bin" \
+  -c "reset run" \
+  -c "rtt setup 0x20000000 0xC0000 {SEGGER RTT}" \
+  -c "rtt start" \
+  -c "rtt server start 9090 0" &
+sleep 4 && nc localhost 9090
+
+nc (netcat) is the serial monitor equivalent here — it just prints everything that comes out of the RTT buffer to your terminal. You'll see the Zephyr boot banner, the bus sniff result, and all the CAN/N2K log messages. Ctrl-C to stop.
+
+reboot the STM32 without reflashing using this:
+
+sudo killall openocd 2>/dev/null
+sleep 1
+sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg \
+  -c "init" \
+  -c "reset run" \
+  -c "rtt setup 0x20000000 0xC0000 {SEGGER RTT}" \
+  -c "rtt start" \
+  -c "rtt server start 9090 0" &
+sleep 3 && nc localhost 9090

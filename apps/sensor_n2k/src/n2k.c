@@ -1,10 +1,14 @@
 #include "n2k.h"
 
 #include <errno.h>
+#include <zephyr/drivers/can.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include "led.h"
 
 LOG_MODULE_REGISTER(n2k, LOG_LEVEL_INF);
+
+static K_SEM_DEFINE(claim_tx_sem, 0, 1);
 
 /*
  * NMEA 2000 / J1939 CAN ID layout (29-bit extended frame):
@@ -31,7 +35,7 @@ uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src)
 	       src;
 }
 
-int n2k_init(const struct device *can_dev)
+int n2k_init(const struct device *can_dev, bool loopback)
 {
 	int ret;
 
@@ -40,12 +44,47 @@ int n2k_init(const struct device *can_dev)
 		return -ENODEV;
 	}
 
+	if (loopback) {
+		ret = can_set_mode(can_dev, CAN_MODE_LOOPBACK);
+		if (ret != 0) {
+			led3r_set(1);
+			LOG_ERR("Failed to set Loopback Mode: %d", ret);
+			return ret;
+		}
+	} else {
+		/* Stop the controller before altering hardware timing engines */
+		can_stop(can_dev);
+
+		/* 1. Calculate precise NMEA 2000 timings: 250,000 bps at 87.5% sample point */
+		struct can_timing timing;
+		int ret = can_calc_timing(can_dev, &timing, 250000, 875);
+		if (ret < 0) {
+			led3r_set(1);
+			LOG_ERR("Failed to set timing calculation: %d", ret);
+			return -1;
+		}
+		/* ret = sample-point deviation in ‰ from 875‰ (0 = exact match).
+		 * Hardware TSEG1 = prop_seg + phase_seg1. */
+		LOG_INF("CAN timing: sp_dev=%d‰ BRP=%u prop=%u phase1=%u phase2=%u SJW=%u",
+			ret, timing.prescaler, timing.prop_seg,
+			timing.phase_seg1, timing.phase_seg2, timing.sjw);
+		/* 2. Commit the calculated timing to the Bosch hardware registers */
+		ret = can_set_timing(can_dev, &timing);
+		if (ret != 0) {
+			led3r_set(1);
+			LOG_ERR("Failed to set timing: %d", ret);
+			return -1;
+		}
+	}
+
 	ret = can_start(can_dev);
 	if (ret != 0 && ret != -EALREADY) {
 		LOG_ERR("Failed to start CAN: %d", ret);
 		return ret;
 	}
-
+	/* let the can HW settle in */
+	k_msleep(100);
+	
 	LOG_INF("N2K CAN ready, SA=0x%02X", N2K_SRC_ADDR);
 	return 0;
 }
@@ -131,13 +170,36 @@ static const struct device *s_can;
  */
 static uint32_t pdu1_id(uint8_t pf, uint8_t dst, uint8_t sa)
 {
-	return (uint32_t)(N2K_PRIORITY & 0x7U) << 26 |
+	uint32_t id = (uint32_t)(N2K_PRIORITY & 0x7U) << 26 |
 	       (uint32_t)pf                    << 16 |
 	       (uint32_t)dst                   <<  8 |
 	       sa;
+	return id & 0x1FFFFFFFU; /* Strict mask to ensure clean Zephyr FDCAN register writing */
 }
 
-/* Broadcast PGN 60928 with the current g_sa and g_name. */
+/*
+ * TX callback: fired by the CAN driver when the hardware finishes (or aborts)
+ * the claim frame. We record the error but never gate the 250ms conflict
+ * window on it — the window starts at transmission time per ISO 11783-5 §9.4.
+ */
+static volatile int claim_tx_err;
+
+static void claim_tx_cb(const struct device *dev, int error, void *user_data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+	claim_tx_err = error;
+	k_sem_give(&claim_tx_sem);
+}
+
+/*
+ * Build and queue PGN 60928 for broadcast with the current g_sa / g_name.
+ * Returns 0 if the frame was accepted by the CAN controller, negative errno
+ * if the controller rejected it immediately (bus-off, no mailbox within 100ms).
+ *
+ * The caller MUST start the 250ms conflict window immediately after this
+ * returns 0 — do NOT wait for the TX callback first.
+ */
 static int claim_send(void)
 {
 	struct can_frame f = {0};
@@ -148,7 +210,34 @@ static int claim_send(void)
 	for (int i = 0; i < 8; i++) {
 		f.data[i] = (uint8_t)(g_name >> (i * 8));
 	}
-	return can_send(s_can, &f, K_MSEC(100), NULL, NULL);
+
+	k_sem_reset(&claim_tx_sem);
+	claim_tx_err = 0;
+
+	/*
+	 * 100 ms mailbox timeout: on a healthy 250 kbit/s bus a frame takes
+	 * ~0.3 ms; 100 ms is ample even under heavy load.  If we wait longer
+	 * we push the 250ms conflict window dangerously late.
+	 */
+	return can_send(s_can, &f, K_MSEC(100), claim_tx_cb, NULL);
+}
+
+/*
+ * ISO 11783-5 §9.3 — Cannot Claim Address.
+ * Sent when all 253 unicast SAs are exhausted.  Uses SA=0xFE (NULL address)
+ * so other devices know we exist but have no usable address.
+ */
+static void cannot_claim_send(void)
+{
+	struct can_frame f = {0};
+
+	f.id    = pdu1_id(0xEEU, N2K_ADDR_GLOBAL, N2K_ADDR_NULL);
+	f.flags = CAN_FRAME_IDE;
+	f.dlc   = 8;
+	for (int i = 0; i < 8; i++) {
+		f.data[i] = (uint8_t)(g_name >> (i * 8));
+	}
+	can_send(s_can, &f, K_MSEC(100), NULL, NULL);
 }
 
 /*
@@ -210,15 +299,21 @@ static void mgmt_fn(void *a, void *b, void *c)
 
 	while (1) {
 		k_msgq_get(&n2k_mgmt_q, &rx, K_FOREVER);
+		LED4B_BLINK(1);   /* any mgmt frame (PGN 60928 or 59904) received */
 
 		uint8_t pf  = (uint8_t)((rx.id >> 16) & 0xFFU);
 		uint8_t dst = (uint8_t)((rx.id >>  8) & 0xFFU);
 
 		if (pf == 0xEEU) {
 			/* Late address-claim conflict. */
-			if (conflict_check(&rx) && g_sa != N2K_ADDR_NULL) {
-				LOG_WRN("N2K late conflict: re-claiming SA=0x%02X", g_sa);
-				claim_send();
+			if (conflict_check(&rx)) {
+				if (g_sa == N2K_ADDR_NULL) {
+					LOG_ERR("N2K: late conflict, all addresses exhausted");
+					cannot_claim_send();
+				} else {
+					LOG_WRN("N2K: late conflict, re-claiming SA=0x%02X", g_sa);
+					claim_send();
+				}
 			}
 		} else if (pf == 0xEAU) {
 			/* ISO Request — respond only if addressed to us or global. */
@@ -232,10 +327,49 @@ static void mgmt_fn(void *a, void *b, void *c)
 					 | ((uint32_t)rx.data[1] <<  8)
 					 | ((uint32_t)rx.data[2] << 16);
 			if (req_pgn == N2K_PGN_ISO_ADDR_CLAIM) {
-				claim_send();
+				/* Reply with our current claim (or Cannot Claim if g_sa==0xFE). */
+				if (g_sa == N2K_ADDR_NULL) {
+					cannot_claim_send();
+				} else {
+					claim_send();
+				}
 			}
 		}
 	}
+}
+
+/*
+ * Recover the CAN controller from bus-off and restart it.
+ * Waits up to `recovery_ms` for the hardware recovery sequence.
+ */
+static void busoff_recover(uint32_t recovery_ms)
+{
+	enum can_state cs;
+	can_get_state(s_can, &cs, NULL);
+
+	if (cs == CAN_STATE_BUS_OFF) {
+		/* can_recover() clears CCCR.INIT and waits for it to read back 0,
+		 * but M_CAN PSR.BO takes an additional ~6 ms (128×11 bits at
+		 * 250 kbit/s) to clear after INIT is released.  Wait for both. */
+		int rc = can_recover(s_can, K_MSEC(recovery_ms));
+		if (rc != 0) {
+			LOG_WRN("N2K: can_recover timed out (%d), proceeding", rc);
+		}
+		/* Let hardware finish the 128×11 recessive-bit sequence so
+		 * PSR.BO clears before we read state or send the next frame. */
+		k_msleep(15);
+	} else {
+		/* Error-passive with pending TX: stop cancels it, start resets
+		 * the controller state (note: TEC is preserved across stop/start). */
+		can_stop(s_can);
+		k_msleep(15);
+	}
+	can_start(s_can);
+
+	struct can_bus_err_cnt err_cnt;
+	can_get_state(s_can, &cs, &err_cnt);
+	LOG_INF("N2K: recovery complete, state=%d, err TX=%d,RX=%d",
+		cs, err_cnt.tx_err_cnt, err_cnt.rx_err_cnt);
 }
 
 int n2k_negotiate_address(const struct device *can_dev)
@@ -256,41 +390,127 @@ int n2k_negotiate_address(const struct device *can_dev)
 
 	/* Claim loop: try successive addresses until one sticks. */
 	for (;;) {
+		/*
+		 * ISO 11783-5 §9.3 — Cannot Claim Address.
+		 * All unicast SAs exhausted; broadcast with SA=0xFE so other
+		 * devices know this node exists without a usable address.
+		 */
 		if (g_sa >= N2K_ADDR_NULL) {
-			LOG_ERR("N2K: no address available");
+			LED3R_SET(1);
+			LOG_ERR("N2K: all addresses exhausted, sending Cannot Claim");
+			cannot_claim_send();
 			return -EADDRINUSE;
 		}
 
-		claim_send();
-		LOG_INF("N2K: claiming SA=0x%02X …", g_sa);
+		/* Recover from bus-off before attempting TX — a failed prior
+		 * send can leave FDCAN1 in bus-off which silences the RX path. */
+		{
+			enum can_state cs;
+			if (can_get_state(s_can, &cs, NULL) == 0 &&
+			    cs == CAN_STATE_BUS_OFF) {
+				LOG_WRN("N2K: bus-off before claim, recovering");
+				busoff_recover(2000);
+				k_sleep(K_MSEC(50));
+			}
+		}
 
-		/* ISO 11783-5 §9.4: wait 250 ms before declaring success. */
+		LOG_INF("N2K: claiming SA=0x%02X", g_sa);
+
+		int err = claim_send();
+		if (err != 0) {
+			/*
+			 * Controller rejected the frame immediately (bus-off,
+			 * no mailbox, etc.).  Recover and retry the same SA.
+			 */
+			LOG_WRN("N2K: claim enqueue failed (%d), recovering", err);
+			busoff_recover(1000);
+			k_sleep(K_MSEC(200));
+			continue;
+		}
+
+		/*
+		 * ISO 11783-5 §9.4.2 / IEC 61162-3:
+		 * The 250 ms conflict-detection window opens at TRANSMISSION
+		 * TIME, not after the ACK is received.  We must not block on
+		 * the TX callback before starting this window.
+		 */
 		int64_t deadline = k_uptime_get() + 250;
-		bool retry = false;
+		bool conflict = false;
 
 		while (k_uptime_get() < deadline) {
 			int64_t rem = deadline - k_uptime_get();
 			struct can_frame rx;
 
 			if (k_msgq_get(&n2k_mgmt_q, &rx, K_MSEC(rem)) != 0) {
-				break;   /* timed out — no conflict */
+				break;   /* window expired — no conflict */
 			}
-			/* Only address-claim frames matter during startup. */
+			/* Only address-claim frames are relevant during startup. */
 			if (((rx.id >> 16) & 0xFFU) != 0xEEU) {
 				continue;
 			}
 			if (conflict_check(&rx)) {
-				retry = true;
-				break;
+				conflict = true;
+				break;   /* yielded; g_sa already incremented */
 			}
 		}
 
-		if (!retry) {
-			break;
+		if (conflict) {
+			continue;   /* retry with the new g_sa */
+		}
+
+		/*
+		 * No conflict in 250 ms: address is ours per ISO 11783-5 §9.4.
+		 *
+		 * Now wait for the TX callback to confirm the claim frame actually
+		 * reached the wire.  The callback may be delayed if the bus was
+		 * busy with higher-priority traffic during the conflict window.
+		 *
+		 * IEC 61162-3 / ISO 11783-5 recovery cases:
+		 *   TX OK          → address confirmed, done.
+		 *   TX error+busoff → recover controller, retry same SA.
+		 *   TX error only   → retry same SA (transient ACK failure).
+		 *   TX never done   → bus healthy but still busy; re-queue and
+		 *                     wait once more before giving up.
+		 */
+		{
+			int tx_result = k_sem_take(&claim_tx_sem, K_MSEC(1000));
+			enum can_state cs;
+			can_get_state(s_can, &cs, NULL);
+
+			if (tx_result == 0 && claim_tx_err == 0) {
+				/* TX confirmed on wire — address claimed. */
+				LOG_INF("N2K: address claimed SA=0x%02X", g_sa);
+				break;
+			}
+
+			if (cs == CAN_STATE_BUS_OFF) {
+				LOG_WRN("N2K: bus-off after claim window "
+					"(tx=%d err=%d); recovering SA=0x%02X",
+					tx_result, claim_tx_err, g_sa);
+				busoff_recover(2000);
+				k_sleep(K_MSEC(50));
+				continue;
+			}
+
+			if (tx_result == 0 && claim_tx_err != 0) {
+				/* Callback fired but reported an error; bus is OK. */
+				LOG_WRN("N2K: claim TX error %d (state=%d); retrying SA=0x%02X",
+					claim_tx_err, cs, g_sa);
+				continue;
+			}
+
+			/*
+			 * tx_result != 0: callback never fired in 1250 ms.
+			 * The frame is auto-retransmitting; adding another frame
+			 * would jam all three TX mailbox slots. Recover instead
+			 * and let the outer loop issue a fresh single claim.
+			 */
+			LOG_WRN("N2K: claim TX timeout 1.25s "
+				"(state=%d); recovering SA=0x%02X", cs, g_sa);
+			busoff_recover(2000);
+			continue;
 		}
 	}
-
-	LOG_INF("N2K: address claimed SA=0x%02X", g_sa);
 
 	k_thread_create(&n2k_mgmt_td, n2k_mgmt_stack, MGMT_STACK_SIZE,
 			mgmt_fn, NULL, NULL, NULL,

@@ -35,6 +35,13 @@
 int spi_bridge_init(const struct device *can_dev);
 
 /**
+ * Attach the catch-all CAN RX filter.  Must be called AFTER
+ * n2k_negotiate_address() so the N2K management filters occupy lower
+ * filter indices and take priority over this catch-all in M_CAN hardware.
+ */
+int spi_bridge_attach_rx(const struct device *can_dev);
+
+/**
  * Enqueue a CAN frame for transmission to Linux in the next SPI block.
  * Non-blocking: returns -EAGAIN if the queue is full.
  */

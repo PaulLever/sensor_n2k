@@ -1,3 +1,4 @@
+#include <zephyr/dt-bindings/clock/stm32u5_clock.h>
 /*
  * Arduino UNO Q overlay for sensor_n2k.
  *
@@ -6,7 +7,7 @@
  *
  * RDY output: PG13 = gpiochip1 line 70 on the Linux side.
  *
- * FDCAN1 RX/TX: PD0 / PD1
+ * FDCAN1 RX/TX: PB8 / PB9 (Arduino D9 / D10) — avoids USB OTG FS PHY on PA11/PA12
  * 1-Wire data : PB4 (Arduino D8)
  * ADC ch 9    : PA4 (Arduino A0)
  */
@@ -37,11 +38,43 @@
 	};
 };
 
-/* FDCAN1 250 kbit/s classic CAN for NMEA 2000 */
-&fdcan1 {
-	pinctrl-0 = <&fdcan1_rx_pd0 &fdcan1_tx_pd1>;
-	pinctrl-names = "default";
-	bus-speed = <250000>;
-	bus-speed-data = <250000>;
+&gpioh {
 	status = "okay";
 };
+
+&pinctrl {
+    fdcan1_rx_pb8: fdcan1_rx_pb8 {
+        pinmux = <STM32_PINMUX('B', 8, AF9)>; /* FDCAN1_RX on PB8 (D9) */
+        bias-pull-up;
+    };
+
+    fdcan1_tx_pb9: fdcan1_tx_pb9 {
+        pinmux = <STM32_PINMUX('B', 9, AF9)>; /* FDCAN1_TX on PB9 (D10) */
+        slew-rate = "very-high-speed";
+    };
+};
+
+
+/* Correct the root clock tree calculations for the Arduino UNO Q */
+&clk_hse {
+    clock-frequency = <DT_FREQ_M(48)>;
+    status = "okay";
+};
+
+/* FDCAN1 250 kbit/s classic CAN for NMEA 2000 */
+&fdcan1 {
+    /*clocks = <&rcc STM32_CLOCK(APB1_2, 9)>;*/
+    /* 1. Route the FDCAN kernel clock to the external HSE crystal */
+    /*clocks = <&rcc 0xa0>, <&rcc 0x440>;*/
+	
+	pinctrl-0 = <&fdcan1_rx_pb8 &fdcan1_tx_pb9>;
+    pinctrl-names = "default";
+
+	/* Exact hardcoded elements forced by the Zephyr stm32 driver build assertions:
+     * <offset std-filters ext-filters rx-fifo0 rx-fifo1 rx-buf tx-event-fifo tx-buf> */
+    bosch,mram-cfg = <0x0 28 8 3 3 0 3 3>;
+
+    status = "okay";
+
+};
+

@@ -1,6 +1,8 @@
 #include "spi_bridge.h"
+#include "n2k.h"
 
 #include <string.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/can.h>
@@ -79,8 +81,12 @@ static const struct device *s_can_dev;
 
 CAN_MSGQ_DEFINE(ship_msgq, TX_QUEUE_DEPTH);
 
-static uint8_t spi_tx[BLOCK_SIZE];
-static uint8_t spi_rx[BLOCK_SIZE];
+/* 32-byte alignment matches the Cortex-M33 D-cache line size so the
+ * STM32 GPDMA driver can flush/invalidate exact cache lines before and
+ * after each DMA transfer — without this the first TX block's CRC bytes
+ * stay in cache and DMA reads zeros from SRAM. */
+static uint8_t spi_tx[BLOCK_SIZE] __aligned(32);
+static uint8_t spi_rx[BLOCK_SIZE] __aligned(32);
 
 static void set_rdy(int level)
 {
@@ -93,6 +99,8 @@ static void set_rdy(int level)
 
 CAN_MSGQ_DEFINE(can_rx_msgq, 32);
 
+static atomic_t s_rx_count;
+
 static void can_rx_thread_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
@@ -100,6 +108,7 @@ static void can_rx_thread_fn(void *a, void *b, void *c)
 
 	while (1) {
 		if (k_msgq_get(&can_rx_msgq, &rx, K_FOREVER) == 0) {
+			atomic_inc(&s_rx_count);
 			LED3G_BLINK(1);
 			if (k_msgq_put(&ship_msgq, &rx, K_NO_WAIT) == 0) {
 				set_rdy(1);
@@ -217,12 +226,67 @@ static void bridge_thread(void *a, void *b, void *c)
 		int ret = spi_transceive(spi_dev, &spi_cfg, &tx_set, &rx_set);
 		if (ret < 0) {
 			LOG_WRN("SPI transceive error: %d", ret);
-			k_sleep(K_MSEC(10));
+			k_yield();
 			continue;
 		}
 		inject_block(spi_rx);
 		seq++;
 		pack_block(seq);
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* Diagnostic heartbeat (visible in bridge.js SPI output)              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Every 2 s, enqueue one frame to Linux so we can see Zephyr state
+ * without a serial terminal.  CAN ID 0x1EFFFEXX is vendor-proprietary
+ * (will not match any real N2K PGN).
+ *
+ * Frame data layout:
+ *   [0] 0x44 ('D') — diagnostic magic
+ *   [1] CAN state  (0=active 1=warning 2=passive 3=bus_off 4=stopped)
+ *   [2] Claimed SA (0xFE = not yet claimed)
+ *   [3] Uptime seconds, low byte
+ *   [4] Uptime seconds, high byte
+ *   [5]   RX frame count low byte (frames received from bus via FDCAN1)
+ *   [6]   RX frame count high byte
+ *   [7]   Last ISO Request TX result (0xFF=not sent, 0x00=ok, else errno)
+ */
+#define DIAG_CAN_ID   0x1EFFFEFUL
+#define DIAG_INTERVAL K_SECONDS(2)
+
+K_THREAD_STACK_DEFINE(diag_stack, 1024);
+static struct k_thread diag_td;
+
+static void diag_thread(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+	while (1) {
+		k_sleep(DIAG_INTERVAL);
+
+		enum can_state cs = CAN_STATE_STOPPED;
+		can_get_state(s_can_dev, &cs, NULL);
+
+		uint32_t up_s = (uint32_t)(k_uptime_get() / 1000U);
+		uint16_t rxc  = (uint16_t)atomic_get(&s_rx_count);
+
+		struct can_frame f = {0};
+		f.id      = DIAG_CAN_ID;
+		f.flags   = CAN_FRAME_IDE;
+		f.dlc     = 8;
+		f.data[0] = 0x44U;
+		f.data[1] = (uint8_t)cs;
+		f.data[2] = n2k_sa_get();
+		f.data[3] = (uint8_t)(up_s & 0xFFU);
+		f.data[4] = (uint8_t)((up_s >> 8) & 0xFFU);
+		f.data[5] = (uint8_t)(rxc & 0xFFU);
+		f.data[6] = (uint8_t)((rxc >> 8) & 0xFFU);
+		f.data[7] = 0xFFU;
+
+		spi_bridge_enqueue(&f);
 	}
 }
 
@@ -242,14 +306,17 @@ int spi_bridge_init(const struct device *can_dev)
 
 	if (!device_is_ready(can_dev)) {
 		LOG_ERR("CAN not ready");
+		led3r_blink(3);   /* 3 red blinks = CAN not ready */
 		return -ENODEV;
 	}
 	if (!device_is_ready(spi_dev)) {
 		LOG_ERR("SPI3 not ready");
+		led3g_blink(3);   /* 3 green blinks = SPI3 not ready */
 		return -ENODEV;
 	}
 	if (!gpio_is_ready_dt(&rdy_gpio)) {
 		LOG_ERR("RDY GPIO not ready");
+		led3b_blink(3);   /* 3 blue blinks = RDY GPIO not ready */
 		return -ENODEV;
 	}
 
@@ -259,12 +326,7 @@ int spi_bridge_init(const struct device *can_dev)
 	int ret = can_start(can_dev);
 	if (ret != 0 && ret != -EALREADY) {
 		LOG_ERR("can_start failed: %d", ret);
-		return ret;
-	}
-
-	ret = can_add_rx_filter_msgq(can_dev, &can_rx_msgq, &n2k_rx_filter);
-	if (ret < 0) {
-		LOG_ERR("can_add_rx_filter_msgq failed: %d", ret);
+		led4r_blink(3);   /* 3 LED4-red blinks = can_start failed */
 		return ret;
 	}
 
@@ -273,8 +335,28 @@ int spi_bridge_init(const struct device *can_dev)
 			BRIDGE_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&bridge_thread_data, "spi_bridge");
 
+	k_thread_create(&diag_td, diag_stack, 512,
+			diag_thread, NULL, NULL, NULL,
+			6, 0, K_NO_WAIT);
+	k_thread_name_set(&diag_td, "spi_diag");
+
 	LOG_INF("SPI bridge ready");
 	return 0;
+}
+
+int spi_bridge_attach_rx(const struct device *can_dev)
+{
+	/* Add catch-all AFTER the specific N2K management filters so it gets
+	 * a higher filter index.  M_CAN checks filters in ascending index
+	 * order and uses the first match — putting the catch-all last means
+	 * PGN 60928 and PGN 59904 frames still reach n2k_mgmt_q (lower
+	 * indices) while everything else flows here to ship_msgq. */
+	int ret = can_add_rx_filter_msgq(can_dev, &can_rx_msgq, &n2k_rx_filter);
+
+	if (ret < 0) {
+		LOG_ERR("spi_bridge catch-all filter failed: %d", ret);
+	}
+	return ret;
 }
 
 int spi_bridge_enqueue(const struct can_frame *frame)

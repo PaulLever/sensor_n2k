@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 /* Source address this device claims on the N2K bus */
-#define N2K_SRC_ADDR   0x30U
+//????#define N2K_SRC_ADDR   0x30U
+#define N2K_SRC_ADDR   0x80U
 /* Default priority for environmental / engine PGNs */
 #define N2K_PRIORITY   6U
 
@@ -32,7 +33,7 @@
  * Start the CAN controller (must be called before any send).
  * Returns 0 on success, negative errno on error.
  */
-int n2k_init(const struct device *can_dev);
+int n2k_init(const struct device *can_dev, bool loopback);
 
 /**
  * PGN 130312 – Temperature (8 bytes, single CAN frame).
@@ -68,7 +69,7 @@ uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src);
  *   [63]    Arbitrary Address Capable (1 = device can resolve conflicts)
  *   [62:60] Industry Group            (4 = Marine)
  *   [59:56] System Instance           (0)
- *   [55:49] Device Class              (75 = Propulsion)
+ *   [55:49] Device Class              (75 = Sensors)
  *   [48]    Reserved                  (0)
  *   [47:40] Function                  (130 = Temperature Sensor)
  *   [39:35] Function Instance         (0)
