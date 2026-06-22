@@ -51,12 +51,35 @@ CAN_MSGQ_DEFINE(mon_q,   32);
  */
 static void can_bus_sniff(void)
 {
-	int err;
 	static const struct can_filter f = {
 		.flags = CAN_FILTER_IDE, .id = 0, .mask = 0,
 	};
 
 	LOG_INF("Bus sniff: start");
+
+#if defined(CONFIG_CAN_MCP2515)
+	/*
+	 * MCP2515: entering CONFIG mode (required for set_mode) stalls while any
+	 * CAN frame is in-flight, which hangs the sniff when bus traffic is
+	 * present and adds 10–20 s even on a quiet bus due to retry overhead.
+	 * The MCP2515 is already started in Normal mode by n2k_init(); just add
+	 * a catch-all filter and listen from the current mode.  Normal mode
+	 * generates ACKs, which is acceptable for a go/no-go bus presence check.
+	 */
+	int fid = can_add_rx_filter_msgq(can_dev, &sniff_q, &f);
+	struct can_frame rx;
+	bool heard = (k_msgq_get(&sniff_q, &rx, K_SECONDS(3)) == 0);
+	if (fid >= 0) {
+		can_remove_rx_filter(can_dev, fid);
+	}
+#else
+	/*
+	 * FDCAN / native CAN: use listen-only mode so we don't inject ACK or
+	 * error frames while observing the bus.
+	 */
+	int err;
+	bool heard = false;
+
 	can_stop(can_dev);
 	err = can_set_mode(can_dev, CAN_MODE_LISTENONLY);
 	if (err != 0) {
@@ -70,14 +93,15 @@ static void can_bus_sniff(void)
 	}
 
 	int fid = can_add_rx_filter_msgq(can_dev, &sniff_q, &f);
-
-	struct can_frame rx;
-	bool heard = (k_msgq_get(&sniff_q, &rx, K_SECONDS(3)) == 0);
-
+	heard = (k_msgq_get(&sniff_q, &rx, K_SECONDS(3)) == 0);
 	if (fid >= 0) {
 		can_remove_rx_filter(can_dev, fid);
 	}
 	can_stop(can_dev);
+
+restore:
+	can_set_mode(can_dev, CAN_MODE_NORMAL);
+#endif /* CONFIG_CAN_MCP2515 */
 
 	if (heard) {
 		LOG_INF("Bus sniff: N2K traffic detected — RX OK");
@@ -86,9 +110,6 @@ static void can_bus_sniff(void)
 		LOG_WRN("Bus sniff: no traffic in 3 s — check CANH/CANL");
 		led4r_blink(5);
 	}
-
-restore:
-	can_set_mode(can_dev, CAN_MODE_NORMAL);
 }
 
 
@@ -268,14 +289,20 @@ int main(void)
 	// Give the Arduino Uno Q's internal SPI bridge plenty of time 
     // to negotiate its link with the Qualcomm processor before enabling CAN interrupts.
     k_msleep(2000); 
-	if ((ret = n2k_init(can_dev, false)) != 0) {
+	bool loop_back = false;
+	LOG_INF("Initializing N2K CAN in %s mode...", loop_back ? "loopback" : "normal");
+	if ((ret = n2k_init(can_dev, loop_back)) != 0) {
 		led3r_set(1);
 		LOG_ERR("N2K init failed: %d", ret);
 		////return ret;
 	}
 
 	debug_can_clocks();
-	can_bus_monitor();   /* diagnostic: replace with can_bus_sniff() when done */
+#if defined(CONFIG_CAN_STM32_FDCAN)
+	can_bus_monitor();   /* FDCAN path diagnostic — 30 s listen window */
+#else
+	can_bus_sniff();     /* MCP2515 / SPI CAN: quick 3 s go/no-go check */
+#endif
 
 	/*
 	 * spi_bridge_init() starts the CAN controller and the SPI slave

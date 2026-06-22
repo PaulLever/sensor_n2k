@@ -232,9 +232,10 @@ sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
 ```
 ######################################################################
 WSL — Build
+TARGET="arduino@192.168.86.33"
 sudo cp -r /mnt/d/svjeo/zephyrproject/zephyr/unoq ~/unoq-ws/zephyr/
 scp -r ~/unoq-ws/zephyr/unoq/host-tools/canboatjs-signalk \
-    arduino@192.168.87.35:/tmp/host-tools/
+    ${TARGET}:/tmp/host-tools/
 
 source ~/.venv-zephyr/bin/activate
 cd ~/unoq-ws
@@ -242,7 +243,7 @@ west build -p always -b arduino_uno_q zephyr/unoq/apps/sensor_n2k \
   -- -DCONFIG_USE_DT_CODE_PARTITION=n
 
 WSL — Copy to device
-TARGET="arduino@192.168.87.35"
+TARGET="arduino@192.168.86.33"
 scp ~/unoq-ws/build/zephyr/zephyr.bin ${TARGET}:/tmp/zephyr.bin && \
 scp -r ~/unoq-ws/zephyr/unoq/openocd-flasher ${TARGET}:/tmp/oo && \
 scp -r ~/unoq-ws/zephyr/unoq/host-tools ${TARGET}:/tmp/host-tools
@@ -377,3 +378,48 @@ sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
   -c "rtt start" \
   -c "rtt server start 9090 0" &
 sleep 3 && nc localhost 9090
+
+
+
+==========================================
+canbus shield notes
+Done. Here's a summary of all changes:
+
+---
+What changed
+
+CMakeLists.txt — one-line switch at the top:
+set(USE_MCP2515_SHIELD OFF)   ← change to ON for the shield
+When ON, it automatically appends the MCP2515 overlay and conf file to the build.
+
+boards/arduino_uno_q.overlay (existing) — added &spi2 { status = "disabled"; }. The board's base DTS has SPI2 enabled with spi2_nss_pb9, which would fight for PB9 against FDCAN1_TX. This fix prevents that silently-broken pin conflict that already existed.
+
+boards/arduino_uno_q_mcp2515.overlay (new) — applied on top of the base overlay when the shield is selected. It:
+- Routes zephyr,canbus to &mcp2515
+- Disables fdcan1 (releases PB8/PB9)
+- Overrides SPI2 pinctrl to exclude hardware NSS (so PB9 stays GPIO for software CS)
+- Declares the MCP2515 device: CS=D10/PB9, INT=D2/PB3, 8 MHz crystal, 250 kbit/s / 87.5% sample point
+
+prj_mcp2515.conf (new) — MCP2515 thread stack/priority config. CONFIG_CAN_MCP2515 itself is auto-enabled by Zephyr when the DTS node exists.
+
+No changes to any .c or .h files — the CAN API calls in n2k.c and main.c work identically with the MCP2515 driver. The can_recover() call will return -ENOTSUP on MCP2515 (no bus-off recovery API), which busoff_recover() already handles with a warning and continues.
+now on 192.168.86.33
+
+
+SignalK is not running — no signalk-server process and nothing on port 3000. The bridge.js SPI daemon also appears to be down. Both need to be restarted.
+
+Open two SSH sessions to the UNO Q:
+
+SSH window 1 — SPI-CAN bridge (talks to STM32 over SPI3):
+cd /tmp/host-tools/canboatjs-signalk && sudo node bridge.js
+
+SSH window 2 — SignalK server:
+signalk-server
+
+SignalK listens on port 3000 (HTTP) and 8375 (WebSocket). After starting, confirm it's up:
+sudo ss -tulpn | grep -E '3000|8375'
+
+Then access the UI at http://192.168.87.35:3000 from your browser.
+
+If signalk-server command isn't found:
+npm list -g signalk-server 2>/dev/null || sudo npm install -g signalk-server

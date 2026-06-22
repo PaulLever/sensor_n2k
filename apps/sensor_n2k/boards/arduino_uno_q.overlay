@@ -55,6 +55,14 @@
 };
 
 
+/*
+ * The board dtsi has SPI2 enabled with NSS on PB9 (same pin as FDCAN1_TX).
+ * Disable SPI2 so its pinctrl does not fight for PB9 in the FDCAN build.
+ */
+&spi2 {
+	status = "disabled";
+};
+
 /* Correct the root clock tree calculations for the Arduino UNO Q */
 &clk_hse {
     clock-frequency = <DT_FREQ_M(48)>;

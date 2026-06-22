@@ -1,0 +1,58 @@
+/*
+ * MCP2515 CAN Shield overlay for sensor_n2k — Arduino UNO Q (STM32U585).
+ *
+ * Applied ON TOP of arduino_uno_q.overlay when USE_MCP2515_SHIELD=ON in
+ * CMakeLists.txt.  Overrides the CAN controller selection from FDCAN1 to
+ * the CANADUINO MCP2515 CAN Bus Shield for Arduino UNO.
+ *
+ * Shield wiring (standard Arduino headers):
+ *   Signal   Arduino pin   STM32 pin   SPI2 function
+ *   -------  -----------   ---------   -------------
+ *   SCK      D13           PB13        SPI2_SCK
+ *   MISO     D12           PB14        SPI2_MISO
+ *   MOSI     D11           PB15        SPI2_MOSI
+ *   CS/SS    D10           PB9         GPIO (software CS, ACTIVE_LOW)
+ *   INT      D2            PB3         GPIO (ACTIVE_LOW interrupt)
+ *
+ * The MCP2515 shield uses an 8 MHz crystal.
+ * NMEA 2000 bus speed: 250 kbit/s.
+ */
+
+/ {
+	chosen {
+		zephyr,canbus = &mcp2515;
+	};
+};
+
+/*
+ * FDCAN1 is disabled so PB8 (FDCAN_RX) and PB9 (FDCAN_TX) are released.
+ * PB9 is reused as the MCP2515 software chip-select below.
+ */
+&fdcan1 {
+	status = "disabled";
+};
+
+/*
+ * SPI2 with software CS on PB9 (D10).
+ *
+ * The board dtsi already enables SPI2 with spi2_nss_pb9 in its pinctrl,
+ * which would configure PB9 as AF5 (hardware NSS).  We override that here:
+ * remove hardware NSS from pinctrl so PB9 stays in GPIO mode for cs-gpios.
+ */
+&spi2 {
+	pinctrl-0 = <&spi2_sck_pb13 &spi2_miso_pb14 &spi2_mosi_pb15>;
+	pinctrl-names = "default";
+	cs-gpios = <&gpiob 9 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	mcp2515: can@0 {
+		compatible = "microchip,mcp2515";
+		reg = <0>;
+		spi-max-frequency = <10000000>;           /* MCP2515 max 10 MHz   */
+		int-gpios = <&gpiob 3 GPIO_ACTIVE_LOW>;   /* D2 / PB3             */
+		osc-freq = <16000000>;                    /* 16 MHz shield crystal (CANADUINO) */
+		bitrate = <250000>;                       /* NMEA 2000            */
+		sample-point = <875>;                     /* 87.5 % per N2K spec  */
+		status = "okay";
+	};
+};

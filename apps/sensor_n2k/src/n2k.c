@@ -1,6 +1,7 @@
 #include "n2k.h"
 
 #include <errno.h>
+#include <string.h>
 #include <zephyr/drivers/can.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -282,11 +283,96 @@ static const struct can_filter req_filt = {
 
 CAN_MSGQ_DEFINE(n2k_mgmt_q, 16);
 
-#define MGMT_STACK_SIZE  768
-#define MGMT_PRIO          4
+#define MGMT_STACK_SIZE  1024   /* enlarged for fast-packet payload on stack */
+#define MGMT_PRIO           4
 
 K_THREAD_STACK_DEFINE(n2k_mgmt_stack, MGMT_STACK_SIZE);
 static struct k_thread n2k_mgmt_td;
+
+/* ------------------------------------------------------------------ */
+/* PGN 126996 – Product Information (NMEA 2000 Fast Packet)            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Fast Packet layout (ISO 11783-3 / NMEA 2000):
+ *   Frame 0  — byte[0]: (seq<<5)|0x00  byte[1]: total_bytes  bytes[2-7]: payload[0..5]
+ *   Frame N  — byte[0]: (seq<<5)|N     bytes[1-7]: payload[6+(N-1)*7 .. +7]
+ *
+ * PGN 126996 payload = 134 bytes → 1 first frame + 19 continuation = 20 frames total.
+ */
+static uint8_t s_fp_seq; /* 3-bit rolling sequence tag, incremented per message */
+
+static void product_info_send(void)
+{
+	uint8_t payload[134];
+
+	memset(payload, 0xFF, sizeof(payload));
+
+	/* NMEA 2000 Database Version (uint16 LE) */
+	payload[0] = (uint8_t)(N2K_PROD_DB_VERSION & 0xFFU);
+	payload[1] = (uint8_t)(N2K_PROD_DB_VERSION >> 8);
+
+	/* Manufacturer Product Code (uint16 LE) */
+	payload[2] = (uint8_t)(N2K_PROD_CODE & 0xFFU);
+	payload[3] = (uint8_t)(N2K_PROD_CODE >> 8);
+
+	/* String fields — copy into 32-byte slots; unused bytes remain 0xFF */
+	const char *s;
+	size_t      n;
+
+	s = N2K_PROD_MODEL_ID;
+	n = strlen(s);
+	memcpy(&payload[4],   s, MIN(n, 32U));   /* Model ID            */
+
+	s = N2K_PROD_SW_CODE;
+	n = strlen(s);
+	memcpy(&payload[36],  s, MIN(n, 32U));   /* Software Version    */
+
+	s = N2K_PROD_MODEL_VER;
+	n = strlen(s);
+	memcpy(&payload[68],  s, MIN(n, 32U));   /* Model Version       */
+
+	s = N2K_PROD_SERIAL_CODE;
+	n = strlen(s);
+	memcpy(&payload[100], s, MIN(n, 32U));   /* Serial Code         */
+
+	payload[132] = N2K_PROD_CERT_LEVEL;
+	payload[133] = N2K_PROD_LOAD_EQ;
+
+	uint32_t can_id = n2k_can_id(N2K_PGN_PRODUCT_INFO, N2K_PRIORITY, g_sa);
+	uint8_t  seq    = s_fp_seq & 0x07U;
+	s_fp_seq = (uint8_t)((s_fp_seq + 1U) & 0x07U);
+
+	struct can_frame f = {0};
+	f.id    = can_id;
+	f.flags = CAN_FRAME_IDE;
+	f.dlc   = 8;
+
+	/* Frame 0: sequence tag, total byte count, first 6 payload bytes */
+	f.data[0] = (uint8_t)((seq << 5) | 0x00U);
+	f.data[1] = (uint8_t)sizeof(payload);
+	memcpy(&f.data[2], payload, 6);
+	can_send(s_can, &f, K_MSEC(100), NULL, NULL);
+
+	/* Continuation frames: 7 payload bytes each */
+	size_t  offset = 6;
+	uint8_t fn     = 1;
+
+	while (offset < sizeof(payload)) {
+		size_t chunk = MIN(7U, sizeof(payload) - offset);
+
+		f.data[0] = (uint8_t)((seq << 5) | fn);
+		memcpy(&f.data[1], &payload[offset], chunk);
+		if (chunk < 7U) {
+			memset(&f.data[1 + chunk], 0xFFU, 7U - chunk);
+		}
+		can_send(s_can, &f, K_MSEC(100), NULL, NULL);
+		offset += chunk;
+		fn++;
+	}
+
+	LOG_INF("N2K: sent PGN 126996 product info (%u frames)", fn);
+}
 
 /*
  * Background thread: responds to ISO Requests (PGN 59904) and handles
@@ -332,6 +418,11 @@ static void mgmt_fn(void *a, void *b, void *c)
 					cannot_claim_send();
 				} else {
 					claim_send();
+				}
+			} else if (req_pgn == N2K_PGN_PRODUCT_INFO) {
+				/* Reply with PGN 126996 Product Information (fast packet). */
+				if (g_sa != N2K_ADDR_NULL) {
+					product_info_send();
 				}
 			}
 		}

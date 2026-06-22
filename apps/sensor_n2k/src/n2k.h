@@ -5,8 +5,7 @@
 #include <stdint.h>
 
 /* Source address this device claims on the N2K bus */
-//????#define N2K_SRC_ADDR   0x30U
-#define N2K_SRC_ADDR   0x80U
+#define N2K_SRC_ADDR   0x30U
 /* Default priority for environmental / engine PGNs */
 #define N2K_PRIORITY   6U
 
@@ -58,8 +57,22 @@ uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src);
 
 #define N2K_PGN_ISO_REQUEST      59904UL   /* 0xEA00 — request any PGN */
 #define N2K_PGN_ISO_ADDR_CLAIM   60928UL   /* 0xEE00 — address claim   */
+#define N2K_PGN_PRODUCT_INFO    126996UL   /* 0x1F014 — product info (fast packet) */
 #define N2K_ADDR_NULL            0xFEU     /* cannot claim an address  */
 #define N2K_ADDR_GLOBAL          0xFFU     /* broadcast / no dest      */
+
+/* ------------------------------------------------------------------ */
+/* PGN 126996 – Product Information content (adjust per device)        */
+/* ------------------------------------------------------------------ */
+
+#define N2K_PROD_DB_VERSION   2100U        /* NMEA 2000 DB version × 100 (21.00) */
+#define N2K_PROD_CODE            0U        /* manufacturer product code           */
+#define N2K_PROD_MODEL_ID   "sensor_n2k"  /* model name,      max 32 chars       */
+#define N2K_PROD_SW_CODE       "1.0.0"    /* software version, max 32 chars      */
+#define N2K_PROD_MODEL_VER     "1.0"      /* hardware revision, max 32 chars     */
+#define N2K_PROD_SERIAL_CODE "00000001"   /* serial number,   max 32 chars       */
+#define N2K_PROD_CERT_LEVEL      0U        /* 0 = not certified                  */
+#define N2K_PROD_LOAD_EQ         1U        /* 1 LEN = ≤50 mA bus current         */
 
 /*
  * 64-bit device NAME (ISO 11783-5 §4.2).  Adjust the field constants to
@@ -84,7 +97,7 @@ uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src);
 #define N2K_NAME_FUNCTION      130U      /* Temperature Sensor */
 #define N2K_NAME_FUNC_INSTANCE   0U
 #define N2K_NAME_ECU_INSTANCE    0U
-#define N2K_NAME_MANUFACTURER  0x7FFU   /* proprietary / unregistered */
+#define N2K_NAME_MANUFACTURER 0x7FEU     /* custom DIY, */
 #define N2K_NAME_IDENTITY        1U      /* change per physical device */
 
 #define N2K_NAME ( \
