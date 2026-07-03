@@ -615,3 +615,11 @@ uint8_t n2k_sa_get(void)
 {
 	return g_sa;
 }
+
+int n2k_send_frame(const struct can_frame *frame)
+{
+	if (s_can == NULL) {
+		return -ENODEV;
+	}
+	return can_send(s_can, frame, K_MSEC(100), NULL, NULL);
+}

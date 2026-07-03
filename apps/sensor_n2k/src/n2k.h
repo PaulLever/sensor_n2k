@@ -13,6 +13,9 @@
  * PGN 130312 – Temperature (single frame, max ~382 °C).
  * Use for 1-wire DS18B20 readings (range −55 … +125 °C).
  */
+#define N2K_PGN_STW           128259UL  /* Speed Through Water            */
+#define N2K_PGN_ENGINE_RAPID  127488UL  /* Engine Parameters Rapid Update */
+
 #define N2K_PGN_TEMP        130312UL
 
 /*
@@ -50,6 +53,13 @@ int n2k_send_temp_ext(const struct device *can_dev,
 
 /** Build the 29-bit CAN ID for a PDU2 (broadcast) NMEA 2000 PGN. */
 uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src);
+
+/**
+ * Transmit a pre-built CAN frame directly on the physical N2K bus (FDCAN).
+ * Usable after n2k_negotiate_address() has been called.
+ * Returns 0 on success, negative errno on error.
+ */
+int n2k_send_frame(const struct can_frame *frame);
 
 /* ------------------------------------------------------------------ */
 /* ISO 11783-5 address management                                       */

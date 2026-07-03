@@ -26,12 +26,117 @@
 const spiLib  = require('spi-device');
 const { FromPgn } = require('@canboat/canboatjs');
 const WebSocket   = require('ws');
+const fs          = require('fs');
+const path        = require('path');
 
 const SPI_DEV = process.argv[2] || '/dev/spidev0.0';
 const SK_HOST = process.argv[3] || 'localhost';
 const SK_PORT = parseInt(process.argv[4] || '3000', 10);
 const SPI_HZ  = 1_000_000;
-const POLL_MS = 50;   /* poll interval — adequate for 1 Hz sensor data */
+const POLL_MS = 500;  /* poll interval — 500ms balances latency vs 1-wire ~18ms bit-bang window */
+
+/* ------------------------------------------------------------------ */
+/* Sensor config — load from /etc/sensor_n2k/config.json at startup    */
+/* ------------------------------------------------------------------ */
+
+const CONFIG_FILE       = '/etc/sensor_n2k/config.json';
+const CFG_CAN_ID_BASE   = 0x1EFFFE00;  /* must match sensor_config.h   */
+
+/* Param IDs (must match sensor_config.h CFG_PARAM_* defines) */
+const P = {
+  OW0_ENABLED: 0x01, OW0_SOURCE: 0x02, OW0_INSTANCE: 0x03, OW_POLL_MS: 0x04,
+  OW1_ENABLED: 0x05, OW1_SOURCE: 0x06, OW1_INSTANCE: 0x07,
+  OW2_ENABLED: 0x08, OW2_SOURCE: 0x09, OW2_INSTANCE: 0x0A,
+  OW3_ENABLED: 0x0B, OW3_SOURCE: 0x0C, OW3_INSTANCE: 0x0D,
+  ADC_ENABLED: 0x11, ADC_SOURCE: 0x12, ADC_INSTANCE: 0x13, ADC_POLL_MS: 0x14,
+  PC0_ENABLED: 0x21, PC0_MODE:   0x22, PC0_HZ:       0x23, PC0_PPR:    0x24,
+  PC0_ENG:    0x25, PC0_UPD:    0x26, PC0_AVG:      0x27,
+  PC1_ENABLED: 0x31, PC1_MODE:   0x32, PC1_HZ:       0x33, PC1_PPR:    0x34,
+  PC1_ENG:    0x35, PC1_UPD:    0x36, PC1_AVG:      0x37,
+  SAVE_NVS:   0xFF,
+};
+
+const DEFAULT_CFG = {
+  onewire: {
+    poll_ms: 2000,
+    slots: [
+      { enabled: true,  source: 2, instance: 1 },
+      { enabled: false, source: 2, instance: 2 },
+      { enabled: false, source: 2, instance: 3 },
+      { enabled: false, source: 2, instance: 4 },
+    ],
+  },
+  adc:     { enabled: true,  source: 14, instance: 0, poll_ms: 1000 },
+  pulse: [
+    { enabled: false, mode: 'STW', hz_per_mps: 9.33,  update_ms: 1000, avg_samples: 5 },
+    { enabled: false, mode: 'RPM', pulses_per_rev: 1.0, engine_instance: 0, update_ms: 500, avg_samples: 3 },
+  ],
+};
+
+function loadSensorConfig() {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    }
+  } catch (e) { console.error('[CFG] load error:', e.message); }
+  return JSON.parse(JSON.stringify(DEFAULT_CFG));
+}
+
+function u16LE(v) { return [v & 0xFF, (v >> 8) & 0xFF]; }
+function floatLE(v) { const b = Buffer.allocUnsafe(4); b.writeFloatLE(v); return [...b]; }
+function pad8(arr) { while (arr.length < 8) arr.push(0); return arr.slice(0, 8); }
+
+function cfgFrame(paramId, data) {
+  return { id: (CFG_CAN_ID_BASE | (paramId & 0xFF)) >>> 0, data: Buffer.from(pad8(data)) };
+}
+
+function enqueueSensorConfig(cfg) {
+  const q = txQueue;
+  const ow = cfg.onewire;
+
+  /* 1-Wire: shared poll interval + per-slot params */
+  q.push(cfgFrame(P.OW_POLL_MS, u16LE(ow.poll_ms)));
+  const owSlotParams = [
+    [P.OW0_ENABLED, P.OW0_SOURCE, P.OW0_INSTANCE],
+    [P.OW1_ENABLED, P.OW1_SOURCE, P.OW1_INSTANCE],
+    [P.OW2_ENABLED, P.OW2_SOURCE, P.OW2_INSTANCE],
+    [P.OW3_ENABLED, P.OW3_SOURCE, P.OW3_INSTANCE],
+  ];
+  (ow.slots || []).forEach((slot, i) => {
+    if (i >= 4) { return; }
+    const [ep, sp, ip] = owSlotParams[i];
+    q.push(cfgFrame(ep, [slot.enabled ? 1 : 0]));
+    q.push(cfgFrame(sp, [slot.source]));
+    q.push(cfgFrame(ip, [slot.instance]));
+  });
+
+  const ad = cfg.adc;
+  q.push(cfgFrame(P.ADC_ENABLED,  [ad.enabled ? 1 : 0]));
+  q.push(cfgFrame(P.ADC_SOURCE,   [ad.source]));
+  q.push(cfgFrame(P.ADC_INSTANCE, [ad.instance]));
+  q.push(cfgFrame(P.ADC_POLL_MS,  u16LE(ad.poll_ms)));
+
+  const p0 = cfg.pulse[0];
+  q.push(cfgFrame(P.PC0_ENABLED, [p0.enabled ? 1 : 0]));
+  q.push(cfgFrame(P.PC0_MODE,    [p0.mode === 'RPM' ? 1 : 0]));
+  q.push(cfgFrame(P.PC0_HZ,      floatLE(p0.hz_per_mps || 9.33)));
+  q.push(cfgFrame(P.PC0_PPR,     floatLE(p0.pulses_per_rev || 1.0)));
+  q.push(cfgFrame(P.PC0_ENG,     [p0.engine_instance || 0]));
+  q.push(cfgFrame(P.PC0_UPD,     u16LE(p0.update_ms)));
+  q.push(cfgFrame(P.PC0_AVG,     [p0.avg_samples]));
+
+  const p1 = cfg.pulse[1];
+  q.push(cfgFrame(P.PC1_ENABLED, [p1.enabled ? 1 : 0]));
+  q.push(cfgFrame(P.PC1_MODE,    [p1.mode === 'RPM' ? 1 : 0]));
+  q.push(cfgFrame(P.PC1_HZ,      floatLE(p1.hz_per_mps || 9.33)));
+  q.push(cfgFrame(P.PC1_PPR,     floatLE(p1.pulses_per_rev || 1.0)));
+  q.push(cfgFrame(P.PC1_ENG,     [p1.engine_instance || 0]));
+  q.push(cfgFrame(P.PC1_UPD,     u16LE(p1.update_ms)));
+  q.push(cfgFrame(P.PC1_AVG,     [p1.avg_samples]));
+
+  q.push(cfgFrame(P.SAVE_NVS, []));   /* trigger STM32 NVS persist */
+  console.log(`[CFG] Queued ${q.length} config frames for STM32`);
+}
 
 /* ------------------------------------------------------------------ */
 /* SPI block protocol (must match spi_bridge.c on the Zephyr side)    */
@@ -91,6 +196,20 @@ function buildTxBlock() {
 }
 
 let _transferCount = 0;
+let _stmLastSeen   = 0;   /* ms timestamp of last valid STM32 block */
+let _cfgScheduled  = false;
+
+/* Schedule a fresh config push sequence starting from 'now'.
+ * Called whenever the STM32 is detected (re)connecting. */
+function scheduleConfigPush() {
+  _cfgScheduled = true;
+  [1100, 3700, 8300, 14900].forEach((ms, i) => {
+    setTimeout(() => {
+      pushConfig(i + 1);
+      if (i === 3) { _cfgScheduled = false; }   /* all done */
+    }, ms);
+  });
+}
 
 function parseRxBlock(block) {
   _transferCount++;
@@ -102,6 +221,14 @@ function parseRxBlock(block) {
   }
 
   if (block[0] !== BLOCK_MAGIC || block[1] !== BLOCK_VERSION) return [];
+
+  /* Detect STM32 (re)boot: first valid block after a 5-second gap */
+  const now = Date.now();
+  if (!_cfgScheduled && (now - _stmLastSeen) > 5000) {
+    console.log('[CFG] STM32 online — scheduling config push…');
+    scheduleConfigPush();
+  }
+  _stmLastSeen = now;
 
   const rxCrc   = block[CRC_OFFSET] | (block[CRC_OFFSET + 1] << 8);
   const calcCrc = crc16(block, CRC_OFFSET);
@@ -117,6 +244,8 @@ function parseRxBlock(block) {
     const off    = RECORDS_OFFSET + i * RECORD_SIZE;
     const idWord = block.readUInt32LE(off) >>> 0;
     const dlc    = Math.min(block[off + 4], 8);
+    /* Diagnostic: dump raw record bytes to confirm what Zephyr sent */
+    console.log(`[SPI] record[${i}] raw[off=${off}..${off+15}]: ${block.slice(off, off + 16).toString('hex')}`);
     const frame  = {
       id:   idWord & 0x1FFFFFFF,
       ext:  !!(block[off + 5] & 0x01),   /* CAN_FRAME_IDE = BIT(0) in Zephyr */
@@ -182,22 +311,25 @@ decoder.on('pgn', (parsed) => {
   const values = [];
 
   if (pgn === 130316 || pgn === 130312) {
-    /* canboatjs v3 uses camelCase field names and numeric source codes */
-    const source   = fields.source;
-    const instance = fields.instance !== undefined ? fields.instance : (fields.sid || 0);
-    const tempK    = fields.temperature;   /* Kelvin */
+    /* canboatjs v3 uses camelCase field IDs from pgns.json:
+     *   PGN 130312: temperatureSource, temperatureInstance, actualTemperature
+     *   PGN 130316: temperatureSource, temperatureInstance, temperature        */
+    const source   = fields.temperatureSource   ?? fields.source;
+    const instance = fields.temperatureInstance ?? fields.instance ?? fields.sid ?? 0;
+    /* PGN 130312 uses 'actualTemperature'; PGN 130316 uses 'temperature' */
+    const tempK = fields.actualTemperature ?? fields.temperature;
     if (tempK == null) return;
     const tempC = tempK - 273.15;
 
     let path;
-    /* source is a number (14=EGT, 2=Inside, 3=EngineRoom, 1=Outside) */
+    /* source may be numeric (e.g. 14) or the enum string label */
     if      (source === 14 || source === 'Exhaust Gas Temperature')  path = `propulsion.${instance}.exhaustTemperature`;
     else if (source === 2  || source === 'Inside Temperature')        path = `environment.inside.temperature`;
     else if (source === 3  || source === 'Engine Room Temperature')   path = `environment.engineRoom.temperature`;
     else if (source === 1  || source === 'Outside Temperature')       path = `environment.outside.temperature`;
     else                                                               path = `environment.temperature.instance${source}`;
 
-    values.push({ path, value: tempC });
+    values.push({ path, value: tempK });   /* Signal K stores temperature in Kelvin */
     console.log(`[N2K] PGN ${pgn} (${source}): ${tempC.toFixed(2)} °C → ${path}`);
   }
 
@@ -210,6 +342,13 @@ decoder.on('pgn', (parsed) => {
 
   if (pgn === 128259 && fields['Speed Water Referenced'] != null) {
     values.push({ path: 'navigation.speedThroughWater', value: fields['Speed Water Referenced'] });
+  }
+
+  /* PGN 127488 — Engine Parameters Rapid Update (RPM from pulse counter) */
+  if (pgn === 127488 && fields.engineSpeed != null) {
+    const inst = fields.engineInstance != null ? fields.engineInstance : 0;
+    /* Signal K uses revolutions per second; N2K encodes in RPM */
+    values.push({ path: `propulsion.${inst}.revolutions`, value: fields.engineSpeed / 60 });
   }
 
   if (values.length === 0) return;
@@ -259,11 +398,33 @@ function transfer(spiDev, txBuf) {
   });
 }
 
+function pushConfig(attempt) {
+  const cfg = loadSensorConfig();
+  console.log(`[CFG] Pushing sensor config to STM32 (attempt ${attempt})…`);
+  enqueueSensorConfig(cfg);
+}
+
 async function run() {
   console.log(`[SPI] Opening ${SPI_DEV} at ${SPI_HZ} Hz`);
   const spiDev = await openSpi(SPI_DEV);
 
   connectSK();
+
+  /* Config is pushed dynamically when the STM32 is detected online
+   * (see scheduleConfigPush / parseRxBlock above). No static timers needed. */
+
+  /* Re-push config whenever config.json is saved from the web UI */
+  if (require('fs').existsSync(CONFIG_FILE)) {
+    let reloadTimer = null;
+    require('fs').watch(CONFIG_FILE, () => {
+      clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => {
+        console.log('[CFG] Config file changed — re-pushing to STM32…');
+        enqueueSensorConfig(loadSensorConfig());
+      }, 200);
+    });
+    console.log('[CFG] Watching', CONFIG_FILE, 'for changes');
+  }
 
   const doTransfer = async () => {
     try {

@@ -1,6 +1,8 @@
 #include "adc.h"
 #include "n2k.h"
 #include "onewire.h"
+#include "pulse_counter.h"
+#include "sensor_config.h"
 #include "spi_bridge.h"
 
 #include <zephyr/device.h>
@@ -286,9 +288,11 @@ int main(void)
 	return 0;
 #endif
 	
-	// Give the Arduino Uno Q's internal SPI bridge plenty of time 
-    // to negotiate its link with the Qualcomm processor before enabling CAN interrupts.
-    k_msleep(2000); 
+	sensor_config_load();   /* populate g_sensor_cfg from NVS (or compile-time defaults) */
+
+	/* Give the Arduino UNO Q's internal SPI bridge time to negotiate its
+	 * link with the Qualcomm processor before enabling CAN interrupts. */
+	k_msleep(2000);
 	bool loop_back = false;
 	LOG_INF("Initializing N2K CAN in %s mode...", loop_back ? "loopback" : "normal");
 	if ((ret = n2k_init(can_dev, loop_back)) != 0) {
@@ -337,6 +341,8 @@ int main(void)
 			onewire_thread, NULL, NULL, NULL,
 			PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&ow_thread_data, "1wire");
+
+	pulse_counter_init(can_dev);   /* starts thread only if a counter is enabled */
 
 	return 0;
 }

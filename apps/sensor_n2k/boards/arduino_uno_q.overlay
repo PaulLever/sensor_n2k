@@ -1,9 +1,13 @@
 #include <zephyr/dt-bindings/clock/stm32u5_clock.h>
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
 /*
  * Arduino UNO Q overlay for sensor_n2k.
  *
  * SPI3 (spi3) is the internal SPI bus to the Linux MPU — already enabled
- * with correct pinctrl in arduino_uno_q-common.dtsi.  No changes needed.
+ * with correct pinctrl in arduino_uno_q-common.dtsi.
+ * DMA is added here: without it the 8-byte SPI FIFO causes a header
+ * duplication in every slave-mode transfer (first 8 bytes clock out from
+ * the FIFO, then the interrupt handler restarts TX from spi_tx[0]).
  *
  * RDY output: PG13 = gpiochip1 line 70 on the Linux side.
  *
@@ -20,21 +24,28 @@
 	/* RDY GPIO — must use DT_PATH(zephyr_user) to match can_spi_bridge_n2k */
 	zephyr_user: zephyr,user {
 		rdy_gpios = <&gpiog 13 GPIO_ACTIVE_HIGH>;
+		/*
+		 * Pulse counter inputs (active-high, pull-down).
+		 * Connect signal to D3 (PC0) and/or D6 (PC1).
+		 * Enable in config: g_sensor_cfg.pulse[n].enabled = true.
+		 *   PC0 — D3 / PB0 : STW paddle wheel or tach
+		 *   PC1 — D6 / PB1 : engine RPM or second STW
+		 */
+		pc0_gpios = <&gpiob 0 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+		pc1_gpios = <&gpiob 1 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 	};
 
-	/* 1-Wire bus on PB4 (D8). External 4.7 kΩ pull-up required. */
+	/*
+	 * 1-Wire bus on PB4 (D8). External 4.7 kΩ pull-up to 3.3 V required.
+	 * Sensors are enumerated at runtime (up to MAX_OW_SENSORS = 4).
+	 * No child device nodes — onewire.c drives the bus via the W1 API directly,
+	 * supporting any number of DS18B20s without needing ROM codes in DTS.
+	 */
 	w1_0: onewire {
 		compatible = "zephyr,w1-gpio";
 		gpios = <&gpiob 4 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN | GPIO_PULL_UP)>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-
-		ds18b20_0: ds18b20@0 {
-			compatible = "maxim,ds18b20";
-			reg = <0>;
-			family-code = <0x28>;
-			resolution = <12>;
-		};
 	};
 };
 
@@ -61,6 +72,17 @@
  */
 &spi2 {
 	status = "disabled";
+};
+
+/*
+ * SPI3 DMA: GPDMA1 request 10 = SPI3_RX, request 11 = SPI3_TX.
+ * Use channels 2 (RX) and 3 (TX) — free on this board.
+ * Without DMA the 8-byte FIFO causes header duplication on every transfer.
+ */
+&spi3 {
+	dmas = <&gpdma1 2 10 (STM32_DMA_PERIPH_RX | STM32_DMA_MEM_INC | STM32_DMA_MEM_8BITS | STM32_DMA_PERIPH_8BITS)>,
+	       <&gpdma1 3 11 (STM32_DMA_PERIPH_TX | STM32_DMA_MEM_INC | STM32_DMA_MEM_8BITS | STM32_DMA_PERIPH_8BITS)>;
+	dma-names = "rx", "tx";
 };
 
 /* Correct the root clock tree calculations for the Arduino UNO Q */

@@ -1,0 +1,19 @@
+[Unit]
+Description=Signal K Server
+After=sensor-n2k-bridge.service
+Wants=sensor-n2k-bridge.service
+
+[Service]
+Type=simple
+User=arduino
+WorkingDirectory=/home/arduino
+# npm global bin may be in /usr/local/bin (nodesource install) or /usr/bin
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env signalk-server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

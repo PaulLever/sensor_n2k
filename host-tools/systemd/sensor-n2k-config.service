@@ -1,0 +1,15 @@
+[Unit]
+Description=sensor_n2k Web Config UI (port 3001)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/config-server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

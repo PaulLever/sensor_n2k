@@ -26,4 +26,6 @@ target_sources(app PRIVATE
     src/onewire.c
     src/n2k.c
     src/led.c
+    src/sensor_config.c
+    src/pulse_counter.c
 )

@@ -423,3 +423,113 @@ Then access the UI at http://192.168.87.35:3000 from your browser.
 
 If signalk-server command isn't found:
 npm list -g signalk-server 2>/dev/null || sudo npm install -g signalk-server
+
+=====================
+Here's a summary of all changes across all 4 features:
+
+---
+What was implemented
+
+1 — Pulse counters (src/pulse_counter.h/.c)
+
+- Two GPIO interrupt counters: PC0 on D3/PB0, PC1 on D6/PB1 (free in both FDCAN and MCP2515 builds)
+- Single sampling thread handles both at their independent rates
+- Per-counter config: mode (STW/RPM), Hz/m·s⁻¹ or pulses/rev, update interval 500–2000 ms, ring-buffer average 1–10 samples
+- STW → PGN 128259 (0.01 m/s per bit), RPM → PGN 127488 (0.25 RPM per bit), both via spi_bridge_enqueue
+- Thread only starts if at least one counter is enabled
+- GPIO pins added to boards/arduino_uno_q.overlay inside the existing zephyr_user node
+
+2 — Float LOG fix (src/onewire.c, src/adc.c, prj.conf)
+
+- CONFIG_CBPRINTF_FP_SUPPORT=y added to prj.conf — fixes %f in LOG macros globally
+- Both sensor files also rewritten to use integer-part logging (%d.%02d) as belt-and-suspenders, and to read n2k_source/n2k_instance from g_sensor_cfg
+
+3 — Configuration table (src/sensor_config.h/.c, src/spi_bridge.c, Linux tools)
+
+- sensor_cfg_t struct covers 1-Wire, ADC, and both pulse counters; compile-time defaults in sensor_config.h
+- NVS persistence via Zephyr Settings (storage_partition at 0xE0000); sensor_config_load() called before any thread starts
+- Runtime update protocol: bridge.js sends vendor-proprietary CAN frames (ID 0x1EFFFE__) at startup; spi_bridge.c inject_block() intercepts them before they reach the bus and calls sensor_config_update()
+- host-tools/canboatjs-signalk/config-server.js: single-file Node.js HTTP server on port 3001 with a full-page HTML form — no frameworks, no new npm deps
+- bridge.js: loads /etc/sensor_n2k/config.json, enqueues config frames 500 ms after SPI opens, added PGN 127488 → Signal K propulsion.N.revolutions decode
+
+4 — Autostart (host-tools/systemd/, docs/LINUX-AUTOSTART.md)
+
+- Three systemd services: sensor-n2k-bridge, sensor-n2k-signalk, sensor-n2k-config
+- Bridge starts first; SignalK Wants= the bridge
+- Full install + update + uninstall procedure in docs/LINUX-AUTOSTART.md
+
+To enable a pulse counter, edit sensor_config.h defaults (for permanent default) or use the web UI at http://<board-ip>:3001 (runtime, persisted to NVS).
+
+
+=======================
+ how do I see debug logs for zephyr side
+
+OpenOCD is already running (you can see it on ports 3333/4444/6666). Since prj.conf has CONFIG_LOG_BACKEND_RTT=y and CONFIG_RTT_CONSOLE=y, all Zephyr LOG output goes to RTT buffer 0. Access it through OpenOCD's RTT server:
+
+SSH window 1 — start RTT in OpenOCD:
+telnet localhost 4444
+Then in the OpenOCD prompt:
+rtt setup 0x20000000 0x50000 "SEGGER RTT"
+rtt start
+rtt server start 9100 0
+(Searches first 320 KB of RAM for the RTT control block, then exposes channel 0 as a TCP stream on port 9100.)
+
+SSH window 2 — read the log stream:
+nc localhost 9100
+
+You should immediately see log output like:
+[00:00:00.012,000] <inf> sensor_cfg: loaded from NVS
+[00:00:00.015,000] <inf> onewire_n2k: 1-wire: 1 DS18B20 sensor(s) on bus
+[00:00:00.750,000] <inf> onewire_n2k: 1-wire[0]: 22.06 C  src=2 inst=1
+[00:00:01.001,000] <inf> adc_n2k: ADC raw=8192  EGT=500.0 C ...
+
+If rtt start says "RTT not found", the symbol address search window might need to be wider — try:
+rtt setup 0x20000000 0xC0000 "SEGGER RTT"
+rtt start
+(STM32U585 has 786 KB SRAM total.)
+
+To increase verbosity, add this to prj.conf and rebuild:
+CONFIG_LOG_DEFAULT_LEVEL=4
+Level 4 = DBG (shows all LOG_DBG calls). Current default is 3 (INF).
+
+Teardown when done:
+rtt server stop 9100
+rtt stop
+in the OpenOCD telnet, or just close the telnet session.
+
+-----------
+OpenOCD has stopped since the last session. Check first:
+
+ps aux | grep openocd
+
+If nothing comes back, start it in a dedicated SSH window — without the flash commands, just the init so it stays connected for RTT:
+
+sudo /opt/openocd/bin/openocd \
+  -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg
+
+It should print something like:
+Info : Listening on port 3333 for gdb connections
+Info : Listening on port 4444 for telnet connections
+Info : Listening on port 6666 for tcl connections
+
+and stay running. Then in a second window:
+
+telnet localhost 4444
+
+If you don't remember the exact config file path:
+find /home/root /opt/openocd -name "*.cfg" 2>/dev/null | grep -i unoq
+# or
+find /home/arduino -name "*.cfg" 2>/dev/null
+
+If you want everything in one step (OpenOCD + RTT server, no manual telnet commands needed):
+
+sudo /opt/openocd/bin/openocd \
+  -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg \
+  -c "init" \
+  -c "rtt setup 0x20000000 0x50000 {SEGGER RTT}" \
+  -c "rtt start" \
+  -c "rtt server start 9100 0"
+
+Then in another window: nc localhost 9100

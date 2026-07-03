@@ -1,5 +1,6 @@
 #include "spi_bridge.h"
 #include "n2k.h"
+#include "sensor_config.h"
 
 #include <string.h>
 #include <zephyr/sys/atomic.h>
@@ -10,6 +11,7 @@
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/cache.h>
 #include "led.h"
 
 LOG_MODULE_REGISTER(spi_bridge, LOG_LEVEL_INF);
@@ -81,10 +83,9 @@ static const struct device *s_can_dev;
 
 CAN_MSGQ_DEFINE(ship_msgq, TX_QUEUE_DEPTH);
 
-/* 32-byte alignment matches the Cortex-M33 D-cache line size so the
- * STM32 GPDMA driver can flush/invalidate exact cache lines before and
- * after each DMA transfer — without this the first TX block's CRC bytes
- * stay in cache and DMA reads zeros from SRAM. */
+/* 32-byte alignment matches the Cortex-M33 D-cache line size.
+ * Cache coherency with the GPDMA is handled by explicit flush/invalidate
+ * calls in bridge_thread around each spi_transceive(). */
 static uint8_t spi_tx[BLOCK_SIZE] __aligned(32);
 static uint8_t spi_rx[BLOCK_SIZE] __aligned(32);
 
@@ -196,6 +197,13 @@ static void inject_block(const uint8_t *blk)
 		f.dlc   = nb;
 		f.flags = CAN_FRAME_IDE;
 		memcpy(f.data, &r[8], nb);
+
+		/* Config frames (0x1EFFFE..) are consumed here; not forwarded to bus */
+		if ((f.id & SENSOR_CFG_CAN_ID_MASK) == SENSOR_CFG_CAN_ID_BASE) {
+			sensor_config_update((uint8_t)(f.id & 0xFFU), f.data, nb);
+			continue;
+		}
+
 		can_send(s_can_dev, &f, K_MSEC(10), NULL, NULL);
 	}
 }
@@ -222,13 +230,35 @@ static void bridge_thread(void *a, void *b, void *c)
 	uint8_t seq = 0;
 	pack_block(seq);
 
+	static uint32_t s_err_count;
+
 	while (1) {
+		/* Flush spi_tx from D-cache to SRAM so GPDMA reads current data.
+		 * Invalidate spi_rx after transfer so CPU reads what GPDMA wrote,
+		 * not stale cache lines.  Required because the STM32U5 GPDMA bypasses
+		 * D-cache; without these calls the TX carries old block data and RX
+		 * reads are coherent with cache (not SRAM) — identical symptom to a
+		 * nocache buffer, but handled here rather than via MPU/linker section
+		 * since ARCH_HAS_NOCACHE_MEMORY_SUPPORT is not available for STM32U5. */
+		sys_cache_data_flush_range(spi_tx, BLOCK_SIZE);
 		int ret = spi_transceive(spi_dev, &spi_cfg, &tx_set, &rx_set);
+		sys_cache_data_invd_range(spi_rx, BLOCK_SIZE);
 		if (ret < 0) {
-			LOG_WRN("SPI transceive error: %d", ret);
-			k_yield();
+			s_err_count++;
+			/* 1-2 timeouts per poll cycle are normal (slave re-arms faster
+			 * than bridge.js polls).  Only log when a real outage starts
+			 * (>10 consecutive errors) and every 50th after that. */
+			if (s_err_count == 10 || s_err_count % 50 == 0) {
+				LOG_WRN("SPI: no master for %u cycles (err=%d)",
+					s_err_count, ret);
+			}
+			k_sleep(K_MSEC(50));
 			continue;
 		}
+		if (s_err_count >= 10) {
+			LOG_INF("SPI: recovered after %u timeout(s)", s_err_count);
+		}
+		s_err_count = 0;
 		inject_block(spi_rx);
 		seq++;
 		pack_block(seq);

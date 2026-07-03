@@ -1,0 +1,17 @@
+[Unit]
+Description=sensor_n2k SPI-CAN Bridge (Zephyr STM32 ↔ Linux)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/bridge.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
