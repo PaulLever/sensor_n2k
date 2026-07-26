@@ -144,79 +144,85 @@ void onewire_thread(void *unused0, void *unused1, void *unused2)
         const ow_cfg_t *cfg    = &g_sensor_cfg.onewire;
         uint32_t        poll_ms = (cfg->poll_ms >= 800U) ? cfg->poll_ms : 2000U;
 
-        if (s_slave_count == 0) {
+        /* Count slots that need real sensor I/O vs. any enabled slot at all */
+        uint8_t real_slots = 0;
+        uint8_t any_enabled = 0;
+        for (uint8_t i = 0; i < MAX_OW_SENSORS; i++) {
+            const ow_slot_cfg_t *s = &cfg->slot[i];
+            if (!s->enabled) { continue; }
+            any_enabled++;
+            if (!s->test_mode && i < s_slave_count) { real_slots++; }
+        }
+
+        if (any_enabled == 0) {
             k_sleep(K_MSEC(poll_ms));
             continue;
         }
 
         int64_t t0 = k_uptime_get();
 
-        /* Step 1: trigger conversion on all sensors at once */
-        int ret = convert_all();
-        if (ret != 0) {
-            LOG_WRN("1-wire: CONVERT T failed (%d)", ret);
-            k_sleep(K_MSEC(poll_ms));
-            continue;
-        }
-
-        /* Step 2: wait for 12-bit conversion to complete */
-        k_msleep(DS18B20_WAIT_MS);
-
-        /* Step 3: read each sensor and emit N2K frame for enabled slots */
-        for (uint8_t i = 0; i < s_slave_count; i++) {
-            const ow_slot_cfg_t *slot = &cfg->slot[i];
-
-            if (!slot->enabled) {
+        /* Step 1: trigger conversion only when real sensors need reading */
+        if (real_slots > 0) {
+            int ret = convert_all();
+            if (ret != 0) {
+                LOG_WRN("1-wire: CONVERT T failed (%d)", ret);
+                k_sleep(K_MSEC(poll_ms));
                 continue;
             }
+            /* Step 2: wait for 12-bit conversion to complete */
+            k_msleep(DS18B20_WAIT_MS);
+        }
+
+        /* Step 3: read or inject test value, then emit N2K frame */
+        for (uint8_t i = 0; i < MAX_OW_SENSORS; i++) {
+            const ow_slot_cfg_t *slot = &cfg->slot[i];
+            if (!slot->enabled) { continue; }
 
             float temp_c;
-            ret = read_sensor(i, &temp_c);
-            if (ret != 0) {
-                LOG_WRN("1-wire[%u]: read failed (%d)", i, ret);
-                continue;
+            if (slot->test_mode) {
+                temp_c = slot->test_value_c;
+                int tc = (int)(temp_c * 100.0f);
+                int tc_abs = (tc < 0) ? -tc : tc;
+                LOG_INF("1-wire[%u]: TEST %s%d.%02d C  src=%u inst=%u",
+                        i, (tc < 0) ? "-" : "",
+                        tc_abs / 100, tc_abs % 100,
+                        slot->n2k_source, slot->n2k_instance);
+            } else {
+                if (i >= s_slave_count) { continue; }
+                int ret = read_sensor(i, &temp_c);
+                if (ret != 0) {
+                    LOG_WRN("1-wire[%u]: read failed (%d)", i, ret);
+                    continue;
+                }
+                int tc = (int)(temp_c * 100.0f);
+                int tc_abs = (tc < 0) ? -tc : tc;
+                LOG_INF("1-wire[%u]: %s%d.%02d C  src=%u inst=%u",
+                        i, (tc < 0) ? "-" : "",
+                        tc_abs / 100, tc_abs % 100,
+                        slot->n2k_source, slot->n2k_instance);
             }
 
-            /* Log as integer parts to avoid %f */
-            int tc = (int)(temp_c * 100.0f);
-            int tc_abs = (tc < 0) ? -tc : tc;
-            LOG_INF("1-wire[%u]: %s%d.%02d C  src=%u inst=%u",
-                    i, (tc < 0) ? "-" : "",
-                    tc_abs / 100, tc_abs % 100,
-                    slot->n2k_source, slot->n2k_instance);
+            float temp_k = temp_c + KELVIN_OFFSET;
 
-            float    temp_k = temp_c + KELVIN_OFFSET;
-            uint16_t raw    = (uint16_t)(temp_k * 100.0f);
-
-            struct can_frame frame = {0};
-            frame.id      = n2k_can_id(N2K_PGN_TEMP, N2K_PRIORITY, n2k_sa_get());
-            frame.flags   = CAN_FRAME_IDE;
-            frame.dlc     = 8;
-            frame.data[0] = 0;                    /* SID */
-            frame.data[1] = slot->n2k_instance;
-            frame.data[2] = slot->n2k_source;
-            frame.data[3] = raw        & 0xFFU;
-            frame.data[4] = (raw >> 8) & 0xFFU;
-            frame.data[5] = 0xFFU;                /* Set Temp N/A */
-            frame.data[6] = 0xFFU;
-            frame.data[7] = 0xFFU;
-
+            struct can_frame frames[N2K_TEMP_MAX_FRAMES];
+            int nframes = n2k_build_temp_frames(slot->n2k_pgn_id,
+                                                slot->n2k_instance,
+                                                slot->n2k_source,
+                                                temp_k, frames);
             LED4B_BLINK(1);
-
-            /* Transmit on the physical N2K bus for other devices (chartplotters etc.) */
-            ret = n2k_send_frame(&frame);
-            if (ret != 0) {
-                LOG_WRN("1-wire[%u]: FDCAN TX failed (%d)", i, ret);
-            }
-
-            /* Also forward to Linux/SignalK via SPI bridge */
-            ret = spi_bridge_enqueue(&frame);
-            if (ret != 0) {
-                LOG_WRN("SPI bridge TX full: %d", ret);
+            for (int fi = 0; fi < nframes; fi++) {
+                int ret = n2k_send_frame(&frames[fi]);
+                if (ret != 0) {
+                    LOG_WRN("1-wire[%u]: FDCAN TX failed (%d)", i, ret);
+                }
+                ret = spi_bridge_enqueue(&frames[fi]);
+                if (ret != 0) {
+                    LOG_WRN("1-wire[%u]: SPI bridge TX full (%d)", i, ret);
+                }
             }
         }
 
-        /* Step 4: sleep for remaining poll time (conversion already consumed 750 ms) */
+        /* Step 4: sleep for remaining poll time */
         int64_t elapsed  = k_uptime_get() - t0;
         int64_t sleep_ms = (int64_t)poll_ms - elapsed;
         if (sleep_ms > 0) {

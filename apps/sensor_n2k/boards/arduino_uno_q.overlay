@@ -31,7 +31,8 @@
 		 *   PC0 — D3 / PB0 : STW paddle wheel or tach
 		 *   PC1 — D6 / PB1 : engine RPM or second STW
 		 */
-		pc0_gpios = <&gpiob 0 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+		//??pc0_gpios = <&gpiob 0 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+		pc0_gpios = <&gpiob 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		pc1_gpios = <&gpiob 1 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 	};
 

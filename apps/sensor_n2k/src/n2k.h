@@ -15,8 +15,11 @@
  */
 #define N2K_PGN_STW           128259UL  /* Speed Through Water            */
 #define N2K_PGN_ENGINE_RAPID  127488UL  /* Engine Parameters Rapid Update */
+#define N2K_PGN_ENGINE_DYN    127489UL  /* Engine Parameters Dynamic (fast-packet, 26 bytes) */
+#define N2K_PGN_TRANS_DYN     127493UL  /* Transmission Parameters Dynamic */
 
-#define N2K_PGN_TEMP        130312UL
+#define N2K_PGN_TEMP          130312UL  /* Temperature (8 bytes, single frame) */
+#define N2K_PGN_ENV_PARAMS    130311UL  /* Environmental Parameters (8 bytes, single frame) */
 
 /*
  * PGN 130316 – Temperature, Extended Range (single frame, up to ~16 500 °C).
@@ -60,6 +63,28 @@ uint32_t n2k_can_id(uint32_t pgn, uint8_t priority, uint8_t src);
  * Returns 0 on success, negative errno on error.
  */
 int n2k_send_frame(const struct can_frame *frame);
+
+/*
+ * Maximum CAN frames produced by n2k_build_temp_frames().
+ * Single-frame PGNs (130312, 130316, 130311) produce 1 frame.
+ * PGN 127489 (fast-packet, 26 bytes) produces 4 frames.
+ */
+#define N2K_TEMP_MAX_FRAMES 4U
+
+/**
+ * Build CAN frame(s) for a temperature reading according to the chosen PGN.
+ *
+ * @param pgn_id    N2K_PGNCFG_* constant from sensor_config.h
+ * @param instance  Temperature instance, or engine instance for ENGINE_DYN
+ * @param source    N2K_TSRC_* source code, or field selector for ENGINE_DYN:
+ *                    0 = Oil Temperature (payload bytes 3-4)
+ *                    1 = Engine/Coolant Temperature (payload bytes 5-6)
+ * @param temp_k    Temperature in Kelvin
+ * @param out       Array of at least N2K_TEMP_MAX_FRAMES can_frame structs
+ * @return          Number of frames written to out[] (1–4), or 0 on error
+ */
+int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
+                           float temp_k, struct can_frame out[N2K_TEMP_MAX_FRAMES]);
 
 /* ------------------------------------------------------------------ */
 /* ISO 11783-5 address management                                       */

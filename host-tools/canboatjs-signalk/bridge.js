@@ -26,12 +26,20 @@
 const spiLib  = require('spi-device');
 const { FromPgn } = require('@canboat/canboatjs');
 const WebSocket   = require('ws');
+const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
 
 const SPI_DEV = process.argv[2] || '/dev/spidev0.0';
 const SK_HOST = process.argv[3] || 'localhost';
 const SK_PORT = parseInt(process.argv[4] || '3000', 10);
+
+/* Optional Signal K credentials — set SK_USER / SK_PASS in the systemd
+ * service Environment= lines (or export them before running manually).
+ * If unset, connection is attempted without a token (works only when SK
+ * security is disabled or set to allow unauthenticated writes). */
+const SK_USER = process.env.SK_USER || '';
+const SK_PASS = process.env.SK_PASS || '';
 const SPI_HZ  = 1_000_000;
 const POLL_MS = 500;  /* poll interval — 500ms balances latency vs 1-wire ~18ms bit-bang window */
 
@@ -48,25 +56,35 @@ const P = {
   OW1_ENABLED: 0x05, OW1_SOURCE: 0x06, OW1_INSTANCE: 0x07,
   OW2_ENABLED: 0x08, OW2_SOURCE: 0x09, OW2_INSTANCE: 0x0A,
   OW3_ENABLED: 0x0B, OW3_SOURCE: 0x0C, OW3_INSTANCE: 0x0D,
+  OW0_PGN: 0x0E, OW1_PGN: 0x0F, OW2_PGN: 0x10, OW3_PGN: 0x1D,
   ADC_ENABLED: 0x11, ADC_SOURCE: 0x12, ADC_INSTANCE: 0x13, ADC_POLL_MS: 0x14,
-  PC0_ENABLED: 0x21, PC0_MODE:   0x22, PC0_HZ:       0x23, PC0_PPR:    0x24,
-  PC0_ENG:    0x25, PC0_UPD:    0x26, PC0_AVG:      0x27,
-  PC1_ENABLED: 0x31, PC1_MODE:   0x32, PC1_HZ:       0x33, PC1_PPR:    0x34,
-  PC1_ENG:    0x35, PC1_UPD:    0x36, PC1_AVG:      0x37,
+  ADC_PGN: 0x15,
+  OW0_TEST_EN: 0x16, OW0_TEST_VAL: 0x17,
+  OW1_TEST_EN: 0x18, OW1_TEST_VAL: 0x19,
+  OW2_TEST_EN: 0x1A, OW2_TEST_VAL: 0x1B,
+  OW3_TEST_EN: 0x1C, OW3_TEST_VAL: 0x1E,
+  ADC_TEST_EN: 0x1F, ADC_TEST_VAL: 0x20,
+  PC0_ENABLED: 0x21, PC0_MODE:    0x22, PC0_HZ:  0x23, PC0_PPR: 0x24,
+  PC0_ENG:    0x25, PC0_UPD:     0x26, PC0_AVG: 0x27,
+  PC1_ENABLED: 0x31, PC1_MODE:    0x32, PC1_HZ:  0x33, PC1_PPR: 0x34,
+  PC1_ENG:    0x35, PC1_UPD:     0x36, PC1_AVG: 0x37,
   SAVE_NVS:   0xFF,
 };
+
+/* N2K_PGNCFG_* values (must match sensor_config.h) */
+const PGNCFG = { TEMP: 0, TEMP_EXT: 1, ENV_PARAMS: 2, ENGINE_DYN: 3, TRANS_DYN: 4 };
 
 const DEFAULT_CFG = {
   onewire: {
     poll_ms: 2000,
     slots: [
-      { enabled: true,  source: 2, instance: 1 },
-      { enabled: false, source: 2, instance: 2 },
-      { enabled: false, source: 2, instance: 3 },
-      { enabled: false, source: 2, instance: 4 },
+      { enabled: true,  pgn_id: PGNCFG.TEMP, source: 2, instance: 1, test_mode: false, test_value_c: 20.0 },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 2, test_mode: false, test_value_c: 20.0 },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 3, test_mode: false, test_value_c: 20.0 },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 4, test_mode: false, test_value_c: 20.0 },
     ],
   },
-  adc:     { enabled: true,  source: 14, instance: 0, poll_ms: 1000 },
+  adc:     { enabled: true, pgn_id: PGNCFG.TEMP_EXT, source: 14, instance: 0, poll_ms: 1000, test_mode: false, test_value_c: 20.0 },
   pulse: [
     { enabled: false, mode: 'STW', hz_per_mps: 9.33,  update_ms: 1000, avg_samples: 5 },
     { enabled: false, mode: 'RPM', pulses_per_rev: 1.0, engine_instance: 0, update_ms: 500, avg_samples: 3 },
@@ -97,17 +115,20 @@ function enqueueSensorConfig(cfg) {
   /* 1-Wire: shared poll interval + per-slot params */
   q.push(cfgFrame(P.OW_POLL_MS, u16LE(ow.poll_ms)));
   const owSlotParams = [
-    [P.OW0_ENABLED, P.OW0_SOURCE, P.OW0_INSTANCE],
-    [P.OW1_ENABLED, P.OW1_SOURCE, P.OW1_INSTANCE],
-    [P.OW2_ENABLED, P.OW2_SOURCE, P.OW2_INSTANCE],
-    [P.OW3_ENABLED, P.OW3_SOURCE, P.OW3_INSTANCE],
+    [P.OW0_ENABLED, P.OW0_SOURCE, P.OW0_INSTANCE, P.OW0_PGN, P.OW0_TEST_EN, P.OW0_TEST_VAL],
+    [P.OW1_ENABLED, P.OW1_SOURCE, P.OW1_INSTANCE, P.OW1_PGN, P.OW1_TEST_EN, P.OW1_TEST_VAL],
+    [P.OW2_ENABLED, P.OW2_SOURCE, P.OW2_INSTANCE, P.OW2_PGN, P.OW2_TEST_EN, P.OW2_TEST_VAL],
+    [P.OW3_ENABLED, P.OW3_SOURCE, P.OW3_INSTANCE, P.OW3_PGN, P.OW3_TEST_EN, P.OW3_TEST_VAL],
   ];
   (ow.slots || []).forEach((slot, i) => {
     if (i >= 4) { return; }
-    const [ep, sp, ip] = owSlotParams[i];
-    q.push(cfgFrame(ep, [slot.enabled ? 1 : 0]));
-    q.push(cfgFrame(sp, [slot.source]));
-    q.push(cfgFrame(ip, [slot.instance]));
+    const [ep, sp, ip, pp, tep, tvp] = owSlotParams[i];
+    q.push(cfgFrame(ep,  [slot.enabled ? 1 : 0]));
+    q.push(cfgFrame(sp,  [slot.source]));
+    q.push(cfgFrame(ip,  [slot.instance]));
+    q.push(cfgFrame(pp,  [slot.pgn_id !== undefined ? slot.pgn_id : PGNCFG.TEMP]));
+    q.push(cfgFrame(tep, [slot.test_mode ? 1 : 0]));
+    q.push(cfgFrame(tvp, floatLE(slot.test_value_c !== undefined ? slot.test_value_c : 20.0)));
   });
 
   const ad = cfg.adc;
@@ -115,6 +136,9 @@ function enqueueSensorConfig(cfg) {
   q.push(cfgFrame(P.ADC_SOURCE,   [ad.source]));
   q.push(cfgFrame(P.ADC_INSTANCE, [ad.instance]));
   q.push(cfgFrame(P.ADC_POLL_MS,  u16LE(ad.poll_ms)));
+  q.push(cfgFrame(P.ADC_PGN,      [ad.pgn_id !== undefined ? ad.pgn_id : PGNCFG.TEMP_EXT]));
+  q.push(cfgFrame(P.ADC_TEST_EN,  [ad.test_mode ? 1 : 0]));
+  q.push(cfgFrame(P.ADC_TEST_VAL, floatLE(ad.test_value_c !== undefined ? ad.test_value_c : 20.0)));
 
   const p0 = cfg.pulse[0];
   q.push(cfgFrame(P.PC0_ENABLED, [p0.enabled ? 1 : 0]));
@@ -263,12 +287,41 @@ function parseRxBlock(block) {
 
 let ws        = null;
 let wsPending = [];
+let skToken   = null;   /* JWT from SK login; refreshed on reconnect */
 
-function connectSK() {
-  const url = `ws://${SK_HOST}:${SK_PORT}/signalk/v1/stream?subscribe=none`;
+/* POST /signalk/v1/auth/login → JWT token, or null on failure/no-auth. */
+function skLogin() {
+  return new Promise((resolve) => {
+    if (!SK_USER || !SK_PASS) { resolve(null); return; }
+    const body = JSON.stringify({ username: SK_USER, password: SK_PASS });
+    const req  = http.request({
+      hostname: SK_HOST, port: SK_PORT,
+      path: '/signalk/v1/auth/login', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = '';
+      res.on('data', d => { data += d; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (j.token) { console.log('[SK] Authenticated as', SK_USER); resolve(j.token); }
+          else { console.warn('[SK] Login failed:', data.substring(0, 120)); resolve(null); }
+        } catch (e) { resolve(null); }
+      });
+    });
+    req.on('error', (e) => { console.warn('[SK] Login request error:', e.message); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function connectSK() {
+  skToken = await skLogin();
+  const tokenParam = skToken ? `&token=${encodeURIComponent(skToken)}` : '';
+  const url = `ws://${SK_HOST}:${SK_PORT}/signalk/v1/stream?subscribe=none${tokenParam}`;
   ws = new WebSocket(url);
   ws.on('open', () => {
-    console.log(`[SK] Connected to ${url}`);
+    console.log(`[SK] Connected to ${url.replace(/token=[^&]+/, 'token=***')}`);
     wsPending.forEach(m => ws.send(m));
     wsPending = [];
   });
@@ -281,8 +334,14 @@ function connectSK() {
 
 function sendDelta(delta) {
   const msg = JSON.stringify(delta);
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(msg);
-  else wsPending.push(msg);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(msg);
+  } else {
+    if (wsPending.length === 0) {
+      console.warn('[SK] Not connected — buffering delta (Signal K not yet reachable?)');
+    }
+    wsPending.push(msg);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -303,7 +362,32 @@ function canIdToPgn(canId) {
     : (dp << 16) | (pf << 8);
 }
 
-decoder.on('pgn', (parsed) => {
+/* ── Engine instance: canboatjs translates 0→"Single Engine or Dual Engine Port",
+ *    1→"Dual Engine Starboard" via its ENGINE_INSTANCE lookup. Return numeric index. ── */
+function engineInstNum(fields) {
+  const raw = fields.engineInstance ?? fields['Engine Instance'] ?? fields.instance;
+  if (raw == null) return 0;
+  if (typeof raw === 'number') return raw;
+  if (typeof raw === 'string') {
+    if (raw.toLowerCase().includes('starboard')) return 1;
+    if (raw.toLowerCase().includes('center') || raw.toLowerCase().includes('centre')) return 2;
+    return 0;  /* Single engine, port, or unknown label */
+  }
+  return 0;
+}
+
+/* ── Temperature source → Signal K path helper ── */
+function tempSourcePath(source, instance) {
+  if      (source === 14 || source === 'Exhaust Gas Temperature')  return `propulsion.${instance}.exhaustTemperature`;
+  else if (source === 2  || source === 'Inside Temperature')        return 'environment.inside.temperature';
+  else if (source === 3  || source === 'Engine Room Temperature')   return 'environment.engineRoom.temperature';
+  else if (source === 1  || source === 'Outside Temperature')       return 'environment.outside.temperature';
+  else                                                               return `environment.temperature.instance${source}`;
+}
+
+/* Central handler for all decoded PGN events — called from both the main
+ * canboatjs decoder (single-frame PGNs) and the fast-packet dispatcher. */
+function handleParsedPgn(parsed) {
   console.log('[N2K] pgn event:', parsed.pgn, JSON.stringify(parsed.fields).substring(0, 80));
   const pgn    = parsed.pgn;
   const fields = parsed.fields || {};
@@ -311,53 +395,126 @@ decoder.on('pgn', (parsed) => {
   const values = [];
 
   if (pgn === 130316 || pgn === 130312) {
-    /* canboatjs v3 uses camelCase field IDs from pgns.json:
-     *   PGN 130312: temperatureSource, temperatureInstance, actualTemperature
-     *   PGN 130316: temperatureSource, temperatureInstance, temperature        */
-    const source   = fields.temperatureSource   ?? fields.source;
-    const instance = fields.temperatureInstance ?? fields.instance ?? fields.sid ?? 0;
-    /* PGN 130312 uses 'actualTemperature'; PGN 130316 uses 'temperature' */
-    const tempK = fields.actualTemperature ?? fields.temperature;
+    const source   = fields.source   ?? fields.temperatureSource;
+    const instance = fields.instance ?? fields.temperatureInstance ?? 0;
+    const tempK    = fields.actualTemperature ?? fields.temperature;
     if (tempK == null) return;
-    const tempC = tempK - 273.15;
+    const path = tempSourcePath(source, instance);
+    values.push({ path, value: tempK });
+    console.log(`[N2K] PGN ${pgn} (${source}): ${(tempK - 273.15).toFixed(2)} °C → ${path}`);
+  }
 
-    let path;
-    /* source may be numeric (e.g. 14) or the enum string label */
-    if      (source === 14 || source === 'Exhaust Gas Temperature')  path = `propulsion.${instance}.exhaustTemperature`;
-    else if (source === 2  || source === 'Inside Temperature')        path = `environment.inside.temperature`;
-    else if (source === 3  || source === 'Engine Room Temperature')   path = `environment.engineRoom.temperature`;
-    else if (source === 1  || source === 'Outside Temperature')       path = `environment.outside.temperature`;
-    else                                                               path = `environment.temperature.instance${source}`;
-
-    values.push({ path, value: tempK });   /* Signal K stores temperature in Kelvin */
-    console.log(`[N2K] PGN ${pgn} (${source}): ${tempC.toFixed(2)} °C → ${path}`);
+  if (pgn === 130311) {
+    const source = fields.temperatureSource ?? fields.source ?? 0;
+    const tempK  = fields.temperature;
+    if (tempK == null) return;
+    const path = tempSourcePath(source, 0);
+    values.push({ path, value: tempK });
+    if (fields.humidity != null)          values.push({ path: 'environment.outside.humidity', value: fields.humidity });
+    if (fields.atmosphericPressure != null) values.push({ path: 'environment.outside.pressure', value: fields.atmosphericPressure });
+    console.log(`[N2K] PGN 130311 (${source}): ${(tempK - 273.15).toFixed(2)} °C → ${path}`);
   }
 
   if (pgn === 127489) {
-    const inst = fields['Engine Instance'];
-    if (fields['Oil Pressure']       != null) values.push({ path: `propulsion.${inst}.oilPressure`,        value: fields['Oil Pressure'] });
-    if (fields['Oil Temperature']    != null) values.push({ path: `propulsion.${inst}.oilTemperature`,     value: fields['Oil Temperature'] - 273.15 });
-    if (fields['Engine Temperature'] != null) values.push({ path: `propulsion.${inst}.coolantTemperature`, value: fields['Engine Temperature'] - 273.15 });
+    const inst = engineInstNum(fields);
+    const oil  = fields.oilTemperature ?? fields['Oil Temperature'];
+    if (oil != null) values.push({ path: `propulsion.${inst}.oilTemperature`, value: oil });
+    const coolant = fields.temperature ?? fields['Engine Temperature'];
+    if (coolant != null) {
+      values.push({ path: `propulsion.${inst}.coolantTemperature`, value: coolant });
+      console.log(`[N2K] PGN 127489 inst=${inst} coolant ${(coolant - 273.15).toFixed(2)} °C`);
+    }
   }
 
-  if (pgn === 128259 && fields['Speed Water Referenced'] != null) {
-    values.push({ path: 'navigation.speedThroughWater', value: fields['Speed Water Referenced'] });
+  if (pgn === 127493) {
+    const inst    = engineInstNum(fields);
+    const oilTemp = fields.oilTemperature ?? fields['Oil Temperature'];
+    if (oilTemp != null) {
+      values.push({ path: `propulsion.${inst}.transmission.oilTemperature`, value: oilTemp });
+      console.log(`[N2K] PGN 127493 inst=${inst}: ${(oilTemp - 273.15).toFixed(2)} °C`);
+    }
   }
 
-  /* PGN 127488 — Engine Parameters Rapid Update (RPM from pulse counter) */
+  if (pgn === 128259) {
+    const stw = fields.speedWaterReferenced ?? fields['Speed Water Referenced'];
+    if (stw != null) values.push({ path: 'navigation.speedThroughWater', value: stw });
+  }
+
   if (pgn === 127488 && fields.engineSpeed != null) {
-    const inst = fields.engineInstance != null ? fields.engineInstance : 0;
-    /* Signal K uses revolutions per second; N2K encodes in RPM */
+    const inst = fields.engineInstance ?? 0;
     values.push({ path: `propulsion.${inst}.revolutions`, value: fields.engineSpeed / 60 });
   }
 
   if (values.length === 0) return;
-
   sendDelta({
     context: 'vessels.self',
     updates: [{ source: { label: 'n2k-bridge', type: 'NMEA2000' }, timestamp: ts, values }],
   });
-});
+}
+
+decoder.on('pgn', handleParsedPgn);
+
+/* ------------------------------------------------------------------ */
+/* Generic fast-packet reassembly                                       */
+/*                                                                      */
+/* Canboatjs keys its fast-packet buffer on (pgn, src) only. When two  */
+/* sequences from the same source and PGN arrive back-to-back (e.g.    */
+/* two engine instances both using PGN 127489) it may fail to start    */
+/* the second assembly cleanly.                                         */
+/*                                                                      */
+/* Fix: intercept all frames for known fast-packet PGNs before they    */
+/* reach canboatjs. Reassemble using (src, pgn, seq) as the key so     */
+/* concurrent sequences never collide. Each complete sequence is fed    */
+/* to a FRESH FromPgn instance for field decoding, then routed through  */
+/* handleParsedPgn exactly as if it had come from the main decoder.     */
+/* ------------------------------------------------------------------ */
+
+/* PGNs that use NMEA 2000 fast-packet framing (payload > 8 bytes).
+ * Derived from canboat pgns.json; extend as needed. */
+const FAST_PACKET_PGNS = new Set([
+  65240,  126208, 126464, 126996, 126998, 127237,
+  127489, 127503, 127506, 127507, 127508,
+  128275, 129029, 129038, 129039, 129040, 129041,
+  129044, 129045, 129794, 129809, 129810,
+  130074, 130323, 130577,
+]);
+
+const fpAssembly = new Map();  /* key: `${src}_${pgn}_${seq}` */
+
+function handleFpFrame(key, frame, pgn, src, prio) {
+  const d  = frame.data;
+  const fn = d[0] & 0x1F;
+
+  if (fn === 0) {
+    /* Start a new assembly, replacing any stale entry with the same key */
+    fpAssembly.set(key, { prio, frames: [frame], total: d[1] });
+  } else {
+    const entry = fpAssembly.get(key);
+    if (!entry) { return; }   /* continuation without a known fn=0 → discard */
+    entry.frames.push(frame);
+    /* frame 0 carries 6 payload bytes; each subsequent frame carries 7 */
+    const received = 6 + (entry.frames.length - 1) * 7;
+    if (received >= entry.total) {
+      fpAssembly.delete(key);
+      dispatchFastPacket(pgn, src, entry.prio, entry.frames);
+    }
+  }
+}
+
+function dispatchFastPacket(pgn, src, prio, frames) {
+  /* Fresh FromPgn per sequence — no stale buffer state, no inter-sequence collision */
+  const fp = new FromPgn();
+  fp.on('pgn', handleParsedPgn);
+  const ts = new Date().toISOString();
+  frames.forEach(f => {
+    const hex = Array.from(f.data).map(b => b.toString(16).padStart(2, '0')).join(',');
+    try {
+      fp.parse(`${ts},${prio},${pgn},${src},255,${f.data.length},${hex}`);
+    } catch (e) {
+      console.error('[FP] decode error PGN', pgn, ':', e.message);
+    }
+  });
+}
 
 function handleFrame(frame) {
   if (!frame.ext) return;
@@ -365,15 +522,26 @@ function handleFrame(frame) {
   const pgn  = canIdToPgn(frame.id);
   const src  = frame.id & 0xFF;
   const prio = (frame.id >> 26) & 0x7;
-  const ts   = new Date().toISOString();
-  const hex  = Array.from(frame.data).map(b => b.toString(16).padStart(2, '0')).join(',');
+  const d    = frame.data;
+  const fn   = d[0] & 0x1F;
+  const seq  = (d[0] >> 5) & 0x07;
+  const key  = `${src}_${pgn}_${seq}`;
 
-  /* canboatjs v3.x: parse() fires the 'pgn' event synchronously */
-  const line = `${ts},${prio},${pgn},${src},255,${frame.data.length},${hex}`;
+  /* Fast-packet PGNs: route through our assembler regardless of frame number */
+  if (FAST_PACKET_PGNS.has(pgn)) {
+    if (fn === 0 || fpAssembly.has(key)) {
+      handleFpFrame(key, frame, pgn, src, prio);
+      return;
+    }
+  }
+
+  /* Single-frame PGN → canboatjs */
+  const ts  = new Date().toISOString();
+  const hex = Array.from(d).map(b => b.toString(16).padStart(2, '0')).join(',');
   try {
-    decoder.parse(line);
+    decoder.parse(`${ts},${prio},${pgn},${src},255,${d.length},${hex}`);
   } catch (e) {
-    console.error('[N2K] parse error:', e.message, 'line:', line);
+    console.error('[N2K] parse error:', e.message);
   }
 }
 
@@ -408,7 +576,7 @@ async function run() {
   console.log(`[SPI] Opening ${SPI_DEV} at ${SPI_HZ} Hz`);
   const spiDev = await openSpi(SPI_DEV);
 
-  connectSK();
+  await connectSK();
 
   /* Config is pushed dynamically when the STM32 is detected online
    * (see scheduleConfigPush / parseRxBlock above). No static timers needed. */

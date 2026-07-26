@@ -1,4 +1,5 @@
 #include "n2k.h"
+#include "sensor_config.h"
 
 #include <errno.h>
 #include <string.h>
@@ -622,4 +623,158 @@ int n2k_send_frame(const struct can_frame *frame)
 		return -ENODEV;
 	}
 	return can_send(s_can, frame, K_MSEC(100), NULL, NULL);
+}
+
+int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
+                           float temp_k, struct can_frame out[N2K_TEMP_MAX_FRAMES])
+{
+	uint8_t sa = n2k_sa_get();
+	struct can_frame *f = &out[0];
+
+	memset(f, 0, sizeof(*f));
+	f->flags = CAN_FRAME_IDE;
+	f->dlc   = 8;
+
+	switch (pgn_id) {
+
+	case N2K_PGNCFG_TEMP: {
+		/* PGN 130312 – Temperature, 0.01 K/bit */
+		if (temp_k > 655.35f) { temp_k = 655.35f; }
+		uint16_t raw = (uint16_t)(temp_k * 100.0f);
+		f->id      = n2k_can_id(N2K_PGN_TEMP, N2K_PRIORITY, sa);
+		f->data[0] = 0;
+		f->data[1] = instance;
+		f->data[2] = source;
+		f->data[3] = raw        & 0xFFU;
+		f->data[4] = (raw >> 8) & 0xFFU;
+		f->data[5] = 0xFFU;
+		f->data[6] = 0xFFU;
+		f->data[7] = 0xFFU;
+		return 1;
+	}
+
+	case N2K_PGNCFG_TEMP_EXT: {
+		/* PGN 130316 – Temperature Extended Range, 0.001 K/bit */
+		uint32_t raw = (uint32_t)(temp_k * 1000.0f);
+		f->id      = n2k_can_id(N2K_PGN_TEMP_EXT, N2K_PRIORITY, sa);
+		f->data[0] = 0;
+		f->data[1] = instance;
+		f->data[2] = source;
+		f->data[3] = raw         & 0xFFU;
+		f->data[4] = (raw >>  8) & 0xFFU;
+		f->data[5] = (raw >> 16) & 0xFFU;
+		f->data[6] = 0xFFU;
+		f->data[7] = 0xFFU;
+		return 1;
+	}
+
+	case N2K_PGNCFG_ENV_PARAMS: {
+		/*
+		 * PGN 130311 – Environmental Parameters (8 bytes, no instance field):
+		 *   Byte 0:   SID
+		 *   Byte 1:   bits[5:0]=Temperature Source, bits[7:6]=Humidity Source(N/A=3)
+		 *   Bytes 2-3: Temperature uint16 LE, 0.01 K/bit
+		 *   Bytes 4-5: Humidity uint16 LE, N/A=0xFFFF
+		 *   Bytes 6-7: Atmospheric Pressure uint16 LE, N/A=0xFFFF
+		 */
+		if (temp_k > 655.35f) { temp_k = 655.35f; }
+		uint16_t raw = (uint16_t)(temp_k * 100.0f);
+		f->id      = n2k_can_id(N2K_PGN_ENV_PARAMS, N2K_PRIORITY, sa);
+		f->data[0] = 0;
+		f->data[1] = (uint8_t)((3U << 6) | (source & 0x3FU));  /* humidity src N/A */
+		f->data[2] = raw        & 0xFFU;
+		f->data[3] = (raw >> 8) & 0xFFU;
+		f->data[4] = 0xFFU;   /* humidity N/A */
+		f->data[5] = 0xFFU;
+		f->data[6] = 0xFFU;   /* pressure N/A */
+		f->data[7] = 0xFFU;
+		return 1;
+	}
+
+	case N2K_PGNCFG_ENGINE_DYN: {
+		/*
+		 * PGN 127489 – Engine Parameters Dynamic (26 bytes, fast-packet, 4 frames).
+		 * All fields N/A except engine instance and one temperature field.
+		 * source=0 → Oil Temperature (payload bytes 3-4, 0.1 K/bit)
+		 * source=1 → Engine/Coolant Temperature (payload bytes 5-6, 0.1 K/bit)
+		 * instance → Engine Instance (payload byte 0)
+		 */
+		uint8_t payload[26];
+		memset(payload, 0xFF, sizeof(payload));
+		payload[0]  = instance;                  /* Engine Instance */
+		payload[24] = 0x7F;                      /* % Engine Load N/A */
+		payload[25] = 0x7F;                      /* % Engine Torque N/A */
+
+		if (source == 0U) {
+			/* Oil Temperature: bytes 3-4, resolution 0.1 K/bit */
+			uint16_t raw = (uint16_t)(temp_k * 10.0f);
+			payload[3] = raw        & 0xFFU;
+			payload[4] = (raw >> 8) & 0xFFU;
+		} else {
+			/* Engine/Coolant Temperature: bytes 5-6, resolution 0.01 K/bit */
+			uint16_t raw = (uint16_t)(temp_k * 100.0f);
+			payload[5] = raw        & 0xFFU;
+			payload[6] = (raw >> 8) & 0xFFU;
+		}
+
+		uint32_t can_id = n2k_can_id(N2K_PGN_ENGINE_DYN, N2K_PRIORITY, sa);
+		uint8_t  seq    = s_fp_seq & 0x07U;
+		s_fp_seq = (uint8_t)((s_fp_seq + 1U) & 0x07U);
+
+		/* Fast-packet frame 0: byte[0]=(seq<<5)|0, byte[1]=total_bytes, bytes[2-7]=payload[0..5] */
+		out[0].id      = can_id;
+		out[0].flags   = CAN_FRAME_IDE;
+		out[0].dlc     = 8;
+		out[0].data[0] = (uint8_t)((seq << 5) | 0x00U);
+		out[0].data[1] = (uint8_t)sizeof(payload);
+		memcpy(&out[0].data[2], payload, 6);
+
+		/* Continuation frames: byte[0]=(seq<<5)|N, bytes[1-7]=next 7 payload bytes */
+		size_t  offset = 6;
+		uint8_t fn     = 1;
+		while (offset < sizeof(payload)) {
+			size_t chunk = (sizeof(payload) - offset < 7U)
+			             ? (sizeof(payload) - offset) : 7U;
+			out[fn].id      = can_id;
+			out[fn].flags   = CAN_FRAME_IDE;
+			out[fn].dlc     = 8;
+			out[fn].data[0] = (uint8_t)((seq << 5) | fn);
+			memcpy(&out[fn].data[1], &payload[offset], chunk);
+			if (chunk < 7U) {
+				memset(&out[fn].data[1 + chunk], 0xFFU, 7U - chunk);
+			}
+			offset += chunk;
+			fn++;
+		}
+		return (int)fn;
+	}
+
+	case N2K_PGNCFG_TRANS_DYN: {
+		/*
+		 * PGN 127493 – Transmission Parameters, Dynamic (single frame).
+		 * instance = engine/transmission instance (payload byte 0)
+		 * source   = unused (oil temperature is the only temp field)
+		 * Byte 0:   Engine Instance
+		 * Byte 1:   Transmission Gear (2-bit N/A=3) | Reserved (6-bit) = 0xFF
+		 * Bytes 2-3: Oil Pressure uint16 LE, 100 Pa/bit — N/A = 0xFFFF
+		 * Bytes 4-5: Oil Temperature uint16 LE, 0.1 K/bit
+		 * Byte 6:   Discrete Status 1 — N/A = 0xFF
+		 * Byte 7:   pad 0xFF
+		 */
+		uint16_t raw = (uint16_t)(temp_k * 10.0f);
+		f->id      = n2k_can_id(N2K_PGN_TRANS_DYN, N2K_PRIORITY, sa);
+		f->data[0] = instance;
+		f->data[1] = 0xFFU;          /* gear=N/A | reserved=all 1s */
+		f->data[2] = 0xFFU;          /* oil pressure N/A */
+		f->data[3] = 0xFFU;
+		f->data[4] = raw        & 0xFFU;
+		f->data[5] = (raw >> 8) & 0xFFU;
+		f->data[6] = 0xFFU;          /* discrete status N/A */
+		f->data[7] = 0xFFU;
+		return 1;
+	}
+
+	default:
+		return 0;
+	}
 }

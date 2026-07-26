@@ -246,3 +246,42 @@ For future deployments from WSL, target the persistent path directly:
 scp .../bridge.js arduino@192.168.87.35:/opt/sensor_n2k/host-tools/canboatjs-signalk/bridge.js
 
 Similarly, the Zephyr binary should live in /opt/sensor_n2k/ or /home/root/zephyr-flash/ (whatever survives reboots on this Debian image) rather than /tmp/.
+
+==========================
+# WSL
+scp /mnt/d/svjeo/zephyrproject/zephyr/unoq/host-tools/canboatjs-signalk/config-server.js \
+    arduino@192.168.86.33:/tmp/config-server.js
+scp /mnt/d/svjeo/zephyrproject/zephyr/unoq/host-tools/canboatjs-signalk/bridge.js \
+    arduino@192.168.86.33:/tmp/bridge.js
+cp -r /mnt/d/svjeo/zephyrproject/zephyr/unoq ~/unoq-ws/zephyr/
+source ~/.venv-zephyr/bin/activate && cd ~/unoq-ws
+
+west build -p always -b arduino_uno_q zephyr/unoq/apps/sensor_n2k \
+  -- -DCONFIG_USE_DT_CODE_PARTITION=n
+
+If the build succeeds, flash and deploy bridge.js:
+TARGET="arduino@192.168.86.33"
+scp ~/unoq-ws/build/zephyr/zephyr.bin ${TARGET}:/tmp/zephyr.bin
+scp /mnt/d/svjeo/zephyrproject/zephyr/unoq/host-tools/canboatjs-signalk/bridge.js \
+    ${TARGET}:/tmp/bridge.js
+
+# Device — flash, update bridge, restart
+sudo killall gpioset 2>/dev/null
+sudo gpioset -c gpiochip1 37=0 & BOOT0=$!; sleep 0.3 && \
+sudo /opt/openocd/bin/openocd -s /opt/openocd/share/openocd/scripts \
+  -f /home/root/zephyr-flash/oo/unoq-swd.cfg \
+  -c init -c halt \
+  -c "flash write_image erase /tmp/zephyr.bin 0x08000000 bin" \
+  -c "verify_image /tmp/zephyr.bin 0x08000000 bin" \
+  -c "reset run" -c shutdown && sudo kill $BOOT0 2>/dev/null
+
+
+
+sudo cp /tmp/bridge.js /opt/sensor_n2k/host-tools/canboatjs-signalk/bridge.js
+sudo systemctl restart sensor-n2k-bridge
+sudo journalctl -u sensor-n2k-bridge -f | grep -E "pgn event|PGN 130|PGN 127"
+
+sudo cp /tmp/bridge.js /opt/sensor_n2k/host-tools/canboatjs-signalk/bridge.js
+sudo cp /tmp/config-server.js /opt/sensor_n2k/host-tools/canboatjs-signalk/config-server.js
+sudo systemctl restart sensor-n2k-bridge
+sudo systemctl restart sensor-n2k-config

@@ -51,6 +51,9 @@ static void pc_publish(uint8_t idx)
 
     /* Snapshot and reset pulse count */
     int32_t pulses = (int32_t)atomic_set(&s->count, 0);
+    if (pulses > 0) {
+            LED4G_BLINK(1);
+    }
     float   hz     = (float)pulses / ((float)cfg->update_ms * 0.001f);
 
     /* Push Hz into ring buffer (always at full PC_AVG_MAX width) */
@@ -119,6 +122,10 @@ static void pc_publish(uint8_t idx)
     }
 
     LED4B_BLINK(1);
+    int r = n2k_send_frame(&f);
+    if (r != 0) {
+        LOG_WRN("PC%u: FDCAN TX failed (%d)", idx, r);
+    }
     spi_bridge_enqueue(&f);
 }
 
@@ -160,10 +167,19 @@ static void pc_thread(void *a, void *b, void *c)
     }
 }
 
+/* ── Public reset (called when a counter is enabled at runtime) ──── */
+void pulse_counter_reset(uint8_t idx)
+{
+    if (idx >= 2U) { return; }
+    atomic_set(&s_state[idx].count, 0);
+    s_state[idx].head   = 0;
+    s_state[idx].filled = 0;
+}
+
 /* ── Public init ─────────────────────────────────────────────────── */
 void pulse_counter_init(const struct device *can_dev)
 {
-    ARG_UNUSED(can_dev);   /* frames go via spi_bridge_enqueue, not direct CAN */
+    ARG_UNUSED(can_dev);
 
     bool any_enabled = false;
 
@@ -175,13 +191,9 @@ void pulse_counter_init(const struct device *can_dev)
             continue;
         }
 
-        /* Always configure as input with pull-down (prevents floating-pin counts) */
+        /* Always configure input + ISR so the counter works if enabled later
+         * via runtime config update without needing a reboot. */
         gpio_pin_configure_dt(&s_gpio[i], GPIO_INPUT);
-
-        if (!cfg->enabled) {
-            LOG_INF("PC%u: disabled", i);
-            continue;
-        }
 
         atomic_set(&s_state[i].count, 0);
         s_state[i].head   = 0;
@@ -191,20 +203,22 @@ void pulse_counter_init(const struct device *can_dev)
         gpio_add_callback(s_gpio[i].port, &s_state[i].cb);
         gpio_pin_interrupt_configure_dt(&s_gpio[i], GPIO_INT_EDGE_RISING);
 
-        LOG_INF("PC%u: %s  update=%u ms  avg=%u  %s",
-                i,
-                cfg->mode == PC_MODE_STW ? "STW" : "RPM",
-                cfg->update_ms,
-                cfg->avg_samples,
-                i == 0U ? "D3/PB0" : "D6/PB1");
-        any_enabled = true;
+        if (cfg->enabled) {
+            LOG_INF("PC%u: %s  update=%u ms  avg=%u  %s",
+                    i,
+                    cfg->mode == PC_MODE_STW ? "STW" : "RPM",
+                    cfg->update_ms,
+                    cfg->avg_samples,
+                    i == 0U ? "D3/PB0" : "D6/PB1");
+            any_enabled = true;
+        } else {
+            LOG_INF("PC%u: disabled (will activate on config update)", i);
+        }
     }
 
-    if (!any_enabled) {
-        LOG_INF("pulse_counter: both disabled — thread not started");
-        return;
-    }
-
+    /* Always start the thread — it checks cfg->enabled each iteration.
+     * This allows runtime enable via bridge.js without a reboot. */
+    (void)any_enabled;
     k_thread_create(&pc_thread_data, pc_stack, PC_STACK_SIZE,
                     pc_thread, NULL, NULL, NULL,
                     PC_PRIO, 0, K_NO_WAIT);
