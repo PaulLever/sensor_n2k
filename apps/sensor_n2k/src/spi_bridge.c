@@ -111,9 +111,12 @@ static void can_rx_thread_fn(void *a, void *b, void *c)
 		if (k_msgq_get(&can_rx_msgq, &rx, K_FOREVER) == 0) {
 			atomic_inc(&s_rx_count);
 			LED3G_BLINK(1);
-			if (k_msgq_put(&ship_msgq, &rx, K_NO_WAIT) == 0) {
-				set_rdy(1);
-			}
+			/* Route through spi_bridge_enqueue() rather than
+			 * k_msgq_put() directly so bus-RX frames and
+			 * sensor-thread frames share one drop counter — see
+			 * s_drop_count below.
+			 */
+			spi_bridge_enqueue(&rx);
 		}
 	}
 }
@@ -282,7 +285,10 @@ static void bridge_thread(void *a, void *b, void *c)
  *   [4] Uptime seconds, high byte
  *   [5]   RX frame count low byte (frames received from bus via FDCAN1)
  *   [6]   RX frame count high byte
- *   [7]   Last ISO Request TX result (0xFF=not sent, 0x00=ok, else errno)
+ *   [7]   ship_msgq drop count, saturating at 0xFF — see
+ *         spi_bridge_drop_count(). Previously "Last ISO Request TX
+ *         result", a field nothing ever actually wrote (always read back
+ *         0xFF="not sent"); repurposed rather than leaving it dead.
  */
 #define DIAG_CAN_ID   0x1EFFFEFUL
 #define DIAG_INTERVAL K_SECONDS(2)
@@ -314,7 +320,7 @@ static void diag_thread(void *a, void *b, void *c)
 		f.data[4] = (uint8_t)((up_s >> 8) & 0xFFU);
 		f.data[5] = (uint8_t)(rxc & 0xFFU);
 		f.data[6] = (uint8_t)((rxc >> 8) & 0xFFU);
-		f.data[7] = 0xFFU;
+		f.data[7] = (uint8_t)spi_bridge_drop_count();
 
 		spi_bridge_enqueue(&f);
 	}
@@ -389,12 +395,40 @@ int spi_bridge_attach_rx(const struct device *can_dev)
 	return ret;
 }
 
+/* Every producer into ship_msgq (real CAN-bus RX via can_rx_thread_fn,
+ * plus onewire/adc/pulse_counter sensor threads and the diagnostic
+ * heartbeat, all via this function) goes through K_NO_WAIT — a full queue
+ * means the frame is silently gone, no retry, no backpressure to the
+ * caller beyond the return code. Nothing previously counted or logged
+ * this. Saturating (not wrapping) so a burst that drops hundreds of
+ * frames reads as "255+", not a confusingly small wrapped number.
+ */
+static atomic_t s_drop_count;
+
 int spi_bridge_enqueue(const struct can_frame *frame)
 {
 	int ret = k_msgq_put(&ship_msgq, frame, K_NO_WAIT);
 
 	if (ret == 0) {
 		set_rdy(1);
+	} else {
+		uint32_t n = (uint32_t)atomic_inc(&s_drop_count) + 1U;
+
+		/* Same throttling pattern as the SPI timeout log above:
+		 * first hit gets attention immediately, then every 50th
+		 * so a sustained burst doesn't flood the log itself.
+		 */
+		if (n == 1U || n % 50U == 0U) {
+			LOG_WRN("ship_msgq full, dropping CAN frame id=0x%08X "
+				"(total dropped=%u)", frame->id, n);
+		}
 	}
 	return ret;
+}
+
+uint32_t spi_bridge_drop_count(void)
+{
+	uint32_t n = (uint32_t)atomic_get(&s_drop_count);
+
+	return (n > 0xFFU) ? 0xFFU : n;
 }

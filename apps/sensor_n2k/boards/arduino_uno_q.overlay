@@ -86,18 +86,30 @@
 	dma-names = "rx", "tx";
 };
 
-/* Correct the root clock tree calculations for the Arduino UNO Q */
+/*
+ * HSE on the Arduino UNO Q is a 16 MHz crystal. Confirmed empirically
+ * on hardware via an LSE-referenced (32.768 kHz, independent oscillator)
+ * DWT cycle-count measurement: 16,000,082 Hz measured, ~5 ppm off nominal.
+ * The board dtsi default of 16 MHz was correct; do not override it.
+ */
 &clk_hse {
-    clock-frequency = <DT_FREQ_M(48)>;
+    clock-frequency = <DT_FREQ_M(16)>;
     status = "okay";
 };
 
 /* FDCAN1 250 kbit/s classic CAN for NMEA 2000 */
 &fdcan1 {
-    /*clocks = <&rcc STM32_CLOCK(APB1_2, 9)>;*/
-    /* 1. Route the FDCAN kernel clock to the external HSE crystal */
-    /*clocks = <&rcc 0xa0>, <&rcc 0x440>;*/
-	
+	/* entry 1 = APB1_2 bus gate; entry 2 = KERNEL clock (times the bits).
+	 * FDCAN1_SEL(0) = HSE per LL_RCC_FDCAN_CLKSOURCE_HSE. Without this
+	 * second entry, can_stm32fd_clock_enable()/get_core_clock() both
+	 * skip configuring/reading the real kernel clock and silently
+	 * assume the 160 MHz APB1_2 bus clock instead, producing a bit rate
+	 * 10x too slow (25 kbit/s instead of 250 kbit/s) since the hardware
+	 * is actually clocked from the untouched HSE.
+	 */
+	clocks = <&rcc STM32_CLOCK(APB1_2, 9)>,
+		 <&rcc STM32_SRC_HSE FDCAN1_SEL(0)>;
+
 	pinctrl-0 = <&fdcan1_rx_pb8 &fdcan1_tx_pb9>;
     pinctrl-names = "default";
 

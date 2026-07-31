@@ -76,16 +76,29 @@ static void can_bus_sniff(void)
 	}
 #else
 	/*
-	 * FDCAN / native CAN: use listen-only mode so we don't inject ACK or
-	 * error frames while observing the bus.
+	 * FDCAN / native CAN: use NORMAL mode, not listen-only.
+	 *
+	 * Listen-only never drives an ACK bit, by design. If this is the only
+	 * other live node acking a sender's frame, the sender sees a
+	 * hardware ACK error and immediately retransmits the identical
+	 * frame - CAN's normal, spec-compliant behavior. With a real bus
+	 * node present that keeps retrying, this turns a "quiet observation"
+	 * into a full-rate retry storm, which is the opposite of "not
+	 * disturbing the bus". Confirmed on hardware: LISTENONLY produced a
+	 * sustained flood of one node's request frame near line rate;
+	 * switching this to NORMAL (which lets us ACK) dropped it to the
+	 * handful of frames actually sent. Normal mode is safe here (unlike
+	 * the historical note further down, which predates the FDCAN clock
+	 * fix — see can_bus_monitor()).
 	 */
 	int err;
+	struct can_frame rx;
 	bool heard = false;
 
 	can_stop(can_dev);
-	err = can_set_mode(can_dev, CAN_MODE_LISTENONLY);
+	err = can_set_mode(can_dev, CAN_MODE_NORMAL);
 	if (err != 0) {
-		LOG_ERR("Bus sniff: failed to set listen-only mode %d", err);
+		LOG_ERR("Bus sniff: failed to set mode %d", err);
 		goto restore;
 	}
 	err = can_start(can_dev);
@@ -118,22 +131,38 @@ restore:
 /*
  * 30-second active bus monitor.
  *
- * Runs in LISTEN-ONLY (bus monitoring) mode: we generate zero bus traffic —
- * no ACK bits, no error flags, nothing.  This lets Garmin's frames complete
- * cleanly without us corrupting them.  Error counters are frozen by the
- * M_CAN hardware in this mode, so only the frame count is meaningful.
+ * Runs in NORMAL mode, not listen-only. Earlier versions of this function
+ * used CAN_MODE_LISTENONLY on the theory that suppressing our own ACK/error
+ * frames would be gentler on the bus. That's backwards: CAN's ACK slot is
+ * part of the protocol, not optional politeness. A sender whose frame goes
+ * unacknowledged sees a hardware ACK error and immediately retransmits the
+ * identical frame — that's automatic, spec-mandated retry, not a bug in the
+ * sender. With only one other live node on the bus and this node unable to
+ * ACK, that retry loop free-runs at (near) full bus rate indefinitely.
  *
- * Previous run (normal mode) result: REC hit 127 the moment Garmin powered
- * on but 0 valid frames were received.  In normal mode our FDCAN was sending
- * active error flags that corrupted Garmin's frames.  This listen-only run
- * removes that interference to isolate whether the CRX signal itself is good.
+ * Confirmed on hardware: a run in LISTENONLY mode logged 43,000+ frames in
+ * ~24 s (near line-rate for 250 kbit/s) — a single ISO Request being retried
+ * nonstop because nothing ever acked it. Switching this function to NORMAL
+ * mode dropped that to 3 frames total, with clean silence afterward — the
+ * real amount of traffic the other node actually intended to send.
+ *
+ * There IS a historical note (see git blame, commit 552eacf1, 2026-06-21)
+ * that normal mode "corrupted Garmin's frames" with REC hitting 127 and 0
+ * frames received. That predates the FDCAN kernel-clock fix (this board's
+ * FDCAN was silently running at ~25 kbit/s instead of 250 kbit/s at the
+ * time — see the fdcan1 `clocks` property in arduino_uno_q.overlay and
+ * debug_can_clocks() in this file). A node transmitting bit-timing garbage
+ * at the wrong rate would produce exactly that symptom on any other node
+ * regardless of ACK behavior. With the clock fix in place, normal mode is
+ * clean — verified end to end here, plus address claim and product-info
+ * broadcast succeeding immediately afterward.
  *
  * How to use:
  *   1. Flash and power on this board.
  *   2. Wait for "Bus monitor: ready" in RTT.
  *   3. Power on Garmin devices.
  *   4. Watch the log for 30 s:
- *        RX frame lines  → CRX signal is good; Garmin frames decode cleanly
+ *        RX frame lines  → CRX signal is good; frames decode cleanly
  *        Silence only    → CRX signal too degraded to form a valid CAN frame
  */
 static void can_bus_monitor(void)
@@ -144,9 +173,9 @@ static void can_bus_monitor(void)
 	int err;
 
 	can_stop(can_dev);
-	err = can_set_mode(can_dev, CAN_MODE_LISTENONLY);
+	err = can_set_mode(can_dev, CAN_MODE_NORMAL);
 	if (err != 0) {
-		LOG_ERR("Bus monitor: listen-only mode failed %d", err);
+		LOG_ERR("Bus monitor: set mode failed %d", err);
 		goto restore;
 	}
 	err = can_start(can_dev);
@@ -161,7 +190,7 @@ static void can_bus_monitor(void)
 		goto stop;
 	}
 
-	LOG_INF("Bus monitor: listen-only, 30 s — power on Garmin now");
+	LOG_INF("Bus monitor: normal mode, 30 s — power on Garmin now");
 
 	uint32_t n_frames = 0;
 	int64_t  t0       = k_uptime_get();
@@ -228,16 +257,28 @@ void debug_can_clocks(void)
     printk("HSE Oscillator Active: %s\n", hse_on ? "YES" : "NO");
     printk("HSE Clock Stabilized:  %s\n", hse_ready ? "YES" : "NO");
 
-    /* RM0456 §7.4.29 CCIPR1 bits[25:24] FDCAN1SEL: 00=HCLK, 01=PLL1_Q, 10=HSE, 11=rsvd */
+    /* There is no HCLK input on the FDCAN kernel mux. Per RM0456 CCIPR1[25:24]
+     * and DS13086 Fig. 5, the mux is fed only by HSE, pll1_q_ck, pll2_p_ck:
+     * 00=HSE, 01=PLL1_Q, 10=PLL2_P, 11=reserved. The previous table here
+     * reported the opposite of the truth (00 as HCLK, 10 as HSE).
+     */
     if (fdcan_sel == 0) {
-        printk("FDCAN Kernel Source:   HCLK=160MHz (MSIS-PLL, LSE-locked) [OK for 250kbit/s]\n");
+        printk("FDCAN Kernel Source:   HSE\n");
     } else if (fdcan_sel == 1) {
         printk("FDCAN Kernel Source:   PLL1_Q\n");
     } else if (fdcan_sel == 2) {
-        printk("FDCAN Kernel Source:   HSE (Crystal 48MHz)\n");
+        printk("FDCAN Kernel Source:   PLL2_P\n");
     } else {
         printk("FDCAN Kernel Source:   Reserved/Unknown (%d)\n", fdcan_sel);
     }
+
+    /* This is what actually sets the bit rate - print it directly rather
+     * than trusting the mux decode above.
+     */
+    uint32_t rate = 0;
+    can_get_core_clock(can_dev, &rate);
+    printk("FDCAN core clock as seen by driver: %u Hz\n", rate);
+
     printk("=============================\n");
 }
 #include <zephyr/drivers/gpio.h>
