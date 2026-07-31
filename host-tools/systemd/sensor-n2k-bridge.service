@@ -8,6 +8,16 @@ Type=simple
 User=root
 WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
 ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/bridge.js
+# Signal K credentials — required when SK security is enabled.
+# Create a user in the SK admin UI (http://<board>:3000/admin → Security → Users),
+# then create /etc/sensor_n2k/signalk.env (root:root, mode 600) containing:
+#   SK_USER=your-user
+#   SK_PASS=your-password
+# The leading '-' makes this optional — service still starts (unauthenticated)
+# if the file doesn't exist, matching bridge.js's behavior when SK security
+# is disabled. Never put real credentials directly in this unit file — it's
+# tracked in git.
+EnvironmentFile=-/etc/sensor_n2k/signalk.env
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

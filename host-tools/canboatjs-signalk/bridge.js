@@ -11,16 +11,29 @@
  *     ├─ canboatjs FromPgn ──► Signal K WebSocket (sensor data & bus PGNs)
  *     └─ SPI TX queue ◄── Signal K outgoing PGNs (future)
  *
- * Usage (run as root for SPI + GPIO access):
- *   sudo node bridge.js [spidev] [rdyGpio] [skHost] [skPort]
+ * Usage (run as root for SPI access):
+ *   sudo node bridge.js [spidev] [skHost] [skPort]
  *
  * Defaults:
  *   spidev    /dev/spidev0.0
- *   rdyGpio   70    (gpiochip1 line 70 — RDY output from STM32)
  *   skHost    localhost
  *   skPort    3000
  *
- * Dependencies:  npm install  spi-device  onoff  @canboat/canboatjs  ws
+ * Dependencies:  npm install  spi-device  @canboat/canboatjs  ws
+ *
+ * NOTE on RDY (gpiochip1 line 70): the Zephyr side still drives this GPIO
+ * high whenever it has data queued (see spi_bridge.c set_rdy()), but this
+ * process does not read it — it polls on a fixed timer instead (see
+ * POLL_MS below) and ignores RDY entirely. An interrupt-driven design
+ * (block on a GPIO edge event instead of sleeping a fixed interval) would
+ * cut both average latency and the risk of the Zephyr-side ship_msgq
+ * (64 frames, non-blocking enqueue, no drop counter) overflowing under a
+ * burst — see the PGN throughput report. Blocked on this kernel not
+ * exposing legacy sysfs GPIO (/sys/class/gpio does not exist here), so the
+ * old `onoff` dependency this file used to list never worked on this board
+ * and was dropped; a working version needs the modern GPIO character-device
+ * edge-event ioctls (e.g. via a libgpiod binding), which is more work than
+ * this fixed-interval tuning pass. Left as a follow-up, not done here.
  */
 
 const spiLib  = require('spi-device');
@@ -29,6 +42,8 @@ const WebSocket   = require('ws');
 const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
+const { spawn }   = require('child_process');
+const readline    = require('readline');
 
 const SPI_DEV = process.argv[2] || '/dev/spidev0.0';
 const SK_HOST = process.argv[3] || 'localhost';
@@ -41,7 +56,39 @@ const SK_PORT = parseInt(process.argv[4] || '3000', 10);
 const SK_USER = process.env.SK_USER || '';
 const SK_PASS = process.env.SK_PASS || '';
 const SPI_HZ  = 1_000_000;
-const POLL_MS = 500;  /* poll interval — 500ms balances latency vs 1-wire ~18ms bit-bang window */
+
+/*
+ * Transfer trigger: interrupt-driven (RDY GPIO edge via gpiomon), not a
+ * fixed poll interval.
+ *
+ * Zephyr already drives gpiochip1 line 70 high whenever ship_msgq has data
+ * (spi_bridge.c set_rdy()) — this used to be read by nothing at all. This
+ * process previously blind-polled on a 500ms timer instead (later tuned to
+ * 50ms), a leftover of an abandoned attempt to use the `onoff` npm package
+ * for GPIO interrupts, which needs legacy sysfs GPIO (/sys/class/gpio) that
+ * doesn't exist on this kernel. `node-libgpiod` was tried next but targets
+ * libgpiod's old v1 C API (gpiod_line, gpiod_line_bulk) — this board ships
+ * libgpiod 2.2.1, which removed those types, so it fails to even compile.
+ * `gpiomon`, libgpiod v2's own CLI tool, is already installed (same
+ * package as gpioset/gpioget, used elsewhere in this project) and is
+ * guaranteed to match the installed library version. Spawning it and
+ * reading edge events off its stdout avoids native compilation entirely.
+ *
+ * BACKSTOP_MS_* remain as a safety net, not the primary path:
+ *   - catches any edge gpiomon's process might miss (crash/respawn window)
+ *   - drains the outbound (Signal K → Zephyr) txQueue, which RDY doesn't
+ *     signal for at all — RDY only reflects Zephyr's own TX side
+ *   - preserves the existing STM32-(re)connect-detection logic below,
+ *     which relies on a transfer happening periodically even when idle
+ * The backstop runs tight (50ms, matching the old pure-polling tuning)
+ * whenever gpiomon isn't confirmed healthy, and relaxed (250ms) once it is,
+ * since interrupts handle the hot path at that point.
+ */
+const BACKSTOP_MS_FALLBACK = 50;
+const BACKSTOP_MS_NORMAL   = 250;
+const RDY_CHIP = 'gpiochip1';
+const RDY_LINE = '70';
+const MAX_DRAIN_ITERS = 20;   /* cap per trigger burst: 20 x 15 = 300 frames */
 
 /* ------------------------------------------------------------------ */
 /* Sensor config — load from /etc/sensor_n2k/config.json at startup    */
@@ -223,6 +270,22 @@ let _transferCount = 0;
 let _stmLastSeen   = 0;   /* ms timestamp of last valid STM32 block */
 let _cfgScheduled  = false;
 
+/* Dropped-block tracking. block[3] ("seq") is Zephyr's own counter,
+ * incremented once per completed SPI transaction (spi_bridge.c: seq++;
+ * pack_block(seq);) regardless of whether that block carried any frames.
+ * As SPI slave, Zephyr's spi_transceive() only returns once the master
+ * (this process) has actually clocked a transaction, so under normal
+ * operation a CRC-valid block's seq should be exactly (last valid seq + 1),
+ * mod 256. A gap here means a transaction happened but this process never
+ * kept a usable block for it — the only way that occurs in this protocol
+ * is a corrupted block that failed CRC and was discarded (see below), but
+ * tracking it via seq (ground truth from Zephyr) rather than just counting
+ * CRC failures also catches anything else that could cause the same
+ * symptom without assuming the cause. */
+let _lastGoodSeq    = null;
+let _crcFailures    = 0;   /* diagnostic: how many blocks arrived corrupted */
+let _seqGapTotal    = 0;   /* authoritative: total blocks lost, any cause */
+
 /* Schedule a fresh config push sequence starting from 'now'.
  * Called whenever the STM32 is detected (re)connecting. */
 function scheduleConfigPush() {
@@ -257,8 +320,23 @@ function parseRxBlock(block) {
   const rxCrc   = block[CRC_OFFSET] | (block[CRC_OFFSET + 1] << 8);
   const calcCrc = crc16(block, CRC_OFFSET);
   if (rxCrc !== calcCrc) {
-    console.warn(`[SPI] CRC mismatch: calc=0x${calcCrc.toString(16)} expected=0x${rxCrc.toString(16)} — processing anyway`);
+    _crcFailures++;
+    console.warn(`[SPI] DROPPED block: CRC mismatch (calc=0x${calcCrc.toString(16)} expected=0x${rxCrc.toString(16)}) — discarding, not processing corrupted data. crcFailures=${_crcFailures}`);
+    /* Do NOT advance _lastGoodSeq here — block[3] itself may be corrupted
+     * too, so it isn't trustworthy. The gap this leaves will be reported
+     * against the next block that DOES pass CRC. */
+    return [];
   }
+
+  const seq = block[3];
+  if (_lastGoodSeq !== null) {
+    const gap = (seq - _lastGoodSeq - 1) & 0xFF;
+    if (gap > 0) {
+      _seqGapTotal += gap;
+      console.warn(`[SPI] DROPPED ${gap} block(s): sequence gap (last good seq=${_lastGoodSeq}, now=${seq}) — total blocks lost=${_seqGapTotal}`);
+    }
+  }
+  _lastGoodSeq = seq;
 
   const count = Math.min(block[2], BLOCK_MAX_FRAMES);
   if (count > 0) console.log(`[SPI] ${count} frame(s) in block`);
@@ -594,19 +672,118 @@ async function run() {
     console.log('[CFG] Watching', CONFIG_FILE, 'for changes');
   }
 
-  const doTransfer = async () => {
+  let _inFlight = false;
+  let _overlapSkips = 0;
+  let _xferDurations = [];   /* rolling window of transfer durations, ms */
+
+  /* One SPI transaction. Returns true if the received block was completely
+   * full (count === BLOCK_MAX_FRAMES) — a heuristic for "more is probably
+   * still queued behind this", used by drainLoop() to decide whether to
+   * immediately transfer again rather than wait for the next trigger. */
+  const doTransferOnce = async () => {
+    if (_inFlight) {
+      /* Previous transfer hasn't resolved yet — skip rather than starting
+       * a second concurrent spiDev.transfer() on the same fd. Should be
+       * rare given ~3-6ms measured transfers vs. the intervals/triggers
+       * this fires on; if this counter climbs, something upstream (an
+       * event storm, a stuck transfer) needs attention. */
+      _overlapSkips++;
+      return false;
+    }
+    _inFlight = true;
+    const t0 = process.hrtime.bigint();
+    let full = false;
     try {
       const rxBuf = await transfer(spiDev, buildTxBlock());
       parseRxBlock(rxBuf).forEach(handleFrame);
+      full = rxBuf[2] === BLOCK_MAX_FRAMES;
     } catch (err) {
       console.error('[SPI] Transfer error:', err.message);
+    } finally {
+      const durMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      _xferDurations.push(durMs);
+      if (_xferDurations.length >= 100) {
+        const avg = _xferDurations.reduce((a, b) => a + b, 0) / _xferDurations.length;
+        const max = Math.max(..._xferDurations);
+        console.log(`[SPI] transfer latency over last ${_xferDurations.length}: avg=${avg.toFixed(2)}ms max=${max.toFixed(2)}ms overlapSkips=${_overlapSkips} crcFailures=${_crcFailures} blocksLost=${_seqGapTotal}`);
+        _xferDurations = [];
+      }
+      _inFlight = false;
+    }
+    return full;
+  };
+
+  /* Keep transferring while the last block came back full (probable
+   * backlog) or there's outbound data queued, bounded so a runaway
+   * producer can't turn one trigger into an unbounded tight loop. */
+  const drainLoop = async (source) => {
+    for (let i = 0; i < MAX_DRAIN_ITERS; i++) {
+      const full = await doTransferOnce();
+      if (!full && txQueue.length === 0) break;
     }
   };
 
-  /* Poll at fixed interval — no sysfs GPIO required */
-  setInterval(doTransfer, POLL_MS);
+  /* ---------------- interrupt-driven trigger (gpiomon) ---------------- */
 
-  console.log(`[bridge] Polling ${SPI_DEV} every ${POLL_MS} ms`);
+  let gpiomonHealthy = false;
+
+  function startGpiomon() {
+    let proc;
+    try {
+      proc = spawn('gpiomon', ['-c', RDY_CHIP, '-e', 'rising', '-F', '%e', RDY_LINE],
+        { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      console.error('[GPIO] Failed to spawn gpiomon:', err.message,
+        '— staying on backstop-only polling');
+      return;
+    }
+
+    const rl = readline.createInterface({ input: proc.stdout });
+    rl.on('line', () => {
+      gpiomonHealthy = true;
+      drainLoop('irq').catch(err => console.error('[SPI] drainLoop(irq) error:', err.message));
+    });
+
+    proc.stderr.on('data', d => {
+      console.error('[GPIO] gpiomon stderr:', d.toString().trim());
+    });
+
+    proc.on('error', err => {
+      gpiomonHealthy = false;
+      console.error('[GPIO] gpiomon process error:', err.message,
+        '— falling back to backstop-only polling');
+    });
+
+    proc.on('exit', (code, signal) => {
+      gpiomonHealthy = false;
+      console.error(`[GPIO] gpiomon exited (code=${code} signal=${signal}) — ` +
+        `dropping to ${BACKSTOP_MS_FALLBACK}ms backstop polling and respawning in 2s`);
+      setTimeout(startGpiomon, 2000);
+    });
+
+    console.log(`[GPIO] gpiomon watching ${RDY_CHIP} line ${RDY_LINE} for rising edges (RDY)`);
+  }
+
+  /* ---------------- backstop (missed edges, outbound TX, reconnect) --- */
+
+  function scheduleBackstop() {
+    const interval = gpiomonHealthy ? BACKSTOP_MS_NORMAL : BACKSTOP_MS_FALLBACK;
+    setTimeout(async () => {
+      try {
+        await drainLoop('backstop');
+      } catch (err) {
+        console.error('[SPI] drainLoop(backstop) error:', err.message);
+      }
+      scheduleBackstop();
+    }, interval);
+  }
+
+  startGpiomon();
+  scheduleBackstop();
+  drainLoop('startup').catch(err => console.error('[SPI] drainLoop(startup) error:', err.message));
+
+  console.log(`[bridge] Interrupt-driven on ${RDY_CHIP}:${RDY_LINE}, ` +
+    `backstop ${BACKSTOP_MS_FALLBACK}/${BACKSTOP_MS_NORMAL}ms (fallback/normal)`);
 }
 
 run().catch(err => { console.error('Fatal:', err); process.exit(1); });
