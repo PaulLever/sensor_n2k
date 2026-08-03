@@ -207,6 +207,24 @@ typedef struct {
 #define CFG_PARAM_PC1_ENG_INST   0x35U
 #define CFG_PARAM_PC1_UPDATE_MS  0x36U
 #define CFG_PARAM_PC1_AVG        0x37U
+/* Alarm hardware I/O — transient commands, not NVS-persisted (they drive
+ * alarm_io.c directly; alarm-server.js on the host owns the actual alarm
+ * rule state). */
+#define CFG_PARAM_ALARM_BUZZER   0x40U  /* d[0]=pattern (0-4, see alarm_io.h), d[1]=volume (v1: stored, unused) */
+#define CFG_PARAM_ALARM_LED      0x41U  /* d[0]=state (0=off,1=on,2=blink) */
+#define CFG_PARAM_ALARM_STOP     0x42U  /* no payload */
+
+/* On-demand bus/device discovery — no payload. Triggers n2k_discover_devices()
+ * (broadcast ISO Request for PGN 60928), same mechanism as the slow periodic
+ * poll in n2k.c, just immediate instead of waiting up to DISCOVER_INTERVAL. */
+#define CFG_PARAM_DISCOVER_DEVICES 0x43U
+
+/* On-demand product info request — no payload. Triggers
+ * n2k_request_product_info() (broadcast ISO Request for PGN 126996), so
+ * bus-monitor-server.js can auto-populate a device's real name instead of
+ * just its manufacturer. */
+#define CFG_PARAM_REQUEST_PRODUCT_INFO 0x44U
+
 /* Persist */
 #define CFG_PARAM_SAVE_NVS       0xFFU
 

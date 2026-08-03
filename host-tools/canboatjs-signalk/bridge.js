@@ -49,6 +49,10 @@ const SPI_DEV = process.argv[2] || '/dev/spidev0.0';
 const SK_HOST = process.argv[3] || 'localhost';
 const SK_PORT = parseInt(process.argv[4] || '3000', 10);
 
+/* Local-only event bus for alarm-server.js / bus-monitor-server.js.
+ * 127.0.0.1-bound — never exposed off-board. */
+const LOCAL_BUS_PORT = 3010;
+
 /* Optional Signal K credentials — set SK_USER / SK_PASS in the systemd
  * service Environment= lines (or export them before running manually).
  * If unset, connection is attempted without a token (works only when SK
@@ -115,6 +119,9 @@ const P = {
   PC0_ENG:    0x25, PC0_UPD:     0x26, PC0_AVG: 0x27,
   PC1_ENABLED: 0x31, PC1_MODE:    0x32, PC1_HZ:  0x33, PC1_PPR: 0x34,
   PC1_ENG:    0x35, PC1_UPD:     0x36, PC1_AVG: 0x37,
+  ALARM_BUZZER: 0x40, ALARM_LED: 0x41, ALARM_STOP: 0x42,
+  DISCOVER_DEVICES: 0x43,
+  REQUEST_PRODUCT_INFO: 0x44,
   SAVE_NVS:   0xFF,
 };
 
@@ -393,6 +400,86 @@ function skLogin() {
   });
 }
 
+/* ------------------------------------------------------------------ */
+/* Local event bus (127.0.0.1:LOCAL_BUS_PORT) — alarm-server.js and       */
+/* bus-monitor-server.js are the clients. Never exposed off-board.        */
+/* ------------------------------------------------------------------ */
+
+function handleLocalBusCommand(msg) {
+  if (!msg || typeof msg.type !== 'string') return;
+
+  switch (msg.type) {
+    case 'buzzer':
+      /* pattern: 0=off,1=continuous,2=repeat-beep,3=single-beep (see
+       * alarm_io.c). volume is accepted/stored on the Zephyr side but a
+       * no-op in v1 hardware. */
+      txQueue.push(cfgFrame(P.ALARM_BUZZER, [
+        (msg.pattern || 0) & 0xFF, (msg.volume || 0) & 0xFF,
+      ]));
+      break;
+    case 'led':
+      txQueue.push(cfgFrame(P.ALARM_LED, [(msg.state || 0) & 0xFF]));
+      break;
+    case 'stop':
+      txQueue.push(cfgFrame(P.ALARM_STOP, []));
+      break;
+    case 'discover':
+      /* On-demand device discovery — broadcasts an ISO Request for PGN
+       * 60928, prompting even passive devices (e.g. instrument displays
+       * that only transmit at their own power-on) to respond. See
+       * n2k_discover_devices() in n2k.c. Follow up with a Product Info
+       * request a couple seconds later so devices that implement PGN
+       * 126996 also report their real name — see n2k_request_product_info(). */
+      txQueue.push(cfgFrame(P.DISCOVER_DEVICES, []));
+      setTimeout(() => txQueue.push(cfgFrame(P.REQUEST_PRODUCT_INFO, [])), 2000);
+      break;
+    default:
+      console.warn('[LocalBus] unknown command type:', msg.type);
+  }
+}
+
+function setupLocalBus() {
+  const wss = new WebSocket.Server({ host: '127.0.0.1', port: LOCAL_BUS_PORT });
+  const clients = new Set();
+
+  wss.on('connection', (sock) => {
+    clients.add(sock);
+    console.log(`[LocalBus] client connected (${clients.size} total)`);
+    sock.on('close', () => {
+      clients.delete(sock);
+      console.log(`[LocalBus] client disconnected (${clients.size} total)`);
+    });
+    sock.on('message', (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw);
+      } catch (e) {
+        console.warn('[LocalBus] malformed message:', e.message);
+        return;
+      }
+      handleLocalBusCommand(msg);
+    });
+    sock.on('error', (e) => console.warn('[LocalBus] client socket error:', e.message));
+  });
+
+  wss.on('error', (err) => {
+    console.error('[LocalBus] server error:', err.message,
+      '— alarm-server.js/bus-monitor-server.js will not receive events until this is fixed');
+  });
+
+  _localBusBroadcast = (obj) => {
+    if (clients.size === 0) return;
+    const line = JSON.stringify(obj);
+    for (const sock of clients) {
+      if (sock.readyState === WebSocket.OPEN) {
+        sock.send(line);
+      }
+    }
+  };
+
+  console.log(`[LocalBus] listening on ws://127.0.0.1:${LOCAL_BUS_PORT}`);
+}
+
 async function connectSK() {
   skToken = await skLogin();
   const tokenParam = skToken ? `&token=${encodeURIComponent(skToken)}` : '';
@@ -463,6 +550,28 @@ function tempSourcePath(source, instance) {
   else                                                               return `environment.temperature.instance${source}`;
 }
 
+/*
+ * decoder.on('pgn', handleParsedPgn) is a persistent, module-level
+ * listener — canboatjs invokes it with whatever it puts in `parsed`, not
+ * with extra args we choose, so a call-specific `src` can't be threaded
+ * in as a second parameter the way a one-shot callback could. Since
+ * `.parse()` is synchronous (canboatjs emits 'pgn' before returning, not
+ * via setImmediate/a promise), tracking "the src of whatever frame we're
+ * currently parsing" in a module-level var set immediately before each
+ * .parse() call is safe on Node's single-threaded event loop — no two
+ * parses can be in flight at once. Prefer parsed.src if canboatjs does
+ * happen to include it (more directly correct if present) and fall back
+ * to this otherwise; verify against the actual installed library once
+ * `npm install` has run, this couldn't be confirmed without node_modules
+ * present.
+ */
+let _lastFrameSrc = 0;
+
+/* Local event bus (127.0.0.1:LOCAL_BUS_PORT) — see setupLocalBus() below.
+ * Assigned once the WS server is created; broadcastLocalBus() is a no-op
+ * until then (harmless during the brief startup window). */
+let _localBusBroadcast = () => {};
+
 /* Central handler for all decoded PGN events — called from both the main
  * canboatjs decoder (single-frame PGNs) and the fast-packet dispatcher. */
 function handleParsedPgn(parsed) {
@@ -470,7 +579,13 @@ function handleParsedPgn(parsed) {
   const pgn    = parsed.pgn;
   const fields = parsed.fields || {};
   const ts     = new Date().toISOString();
+  const src    = (parsed.src !== undefined) ? parsed.src : _lastFrameSrc;
   const values = [];
+
+  /* Broadcast every decoded PGN on the local bus — not just the small
+   * curated subset mapped to Signal K paths below. alarm-server.js and
+   * bus-monitor-server.js both need the full stream. */
+  _localBusBroadcast({ type: 'pgn', ts, src, pgn, fields });
 
   if (pgn === 130316 || pgn === 130312) {
     const source   = fields.source   ?? fields.temperatureSource;
@@ -587,6 +702,7 @@ function dispatchFastPacket(pgn, src, prio, frames) {
   frames.forEach(f => {
     const hex = Array.from(f.data).map(b => b.toString(16).padStart(2, '0')).join(',');
     try {
+      _lastFrameSrc = src;   /* see the comment above handleParsedPgn() */
       fp.parse(`${ts},${prio},${pgn},${src},255,${f.data.length},${hex}`);
     } catch (e) {
       console.error('[FP] decode error PGN', pgn, ':', e.message);
@@ -594,8 +710,54 @@ function dispatchFastPacket(pgn, src, prio, frames) {
   });
 }
 
+/* Fixed diagnostic/event CAN IDs from spi_bridge.c / alarm_io.c — same
+ * proprietary 0x1EFFFEXX family as the sensor-config frames
+ * (SENSOR_CFG_CAN_ID_BASE), but these three are plain fixed IDs, not part
+ * of that param range, so they don't go through inject_block()'s
+ * intercept on the Zephyr side — they're just frames that happen to use
+ * IDs no real N2K PGN would ever use. Must be handled here, before
+ * canIdToPgn()/decoder.parse(), since they aren't real PGNs at all and
+ * would otherwise be silently mis-decoded (or ignored) by the generic path.
+ */
+const DIAG_CAN_ID      = 0x1EFFFEF;
+const DIAG2_CAN_ID     = 0x1EFFFEE;
+const ALARM_BTN_CAN_ID = 0x1EFFFED;
+
+function handleDiagFrame(frame) {
+  const d = frame.data;
+
+  if (frame.id === DIAG_CAN_ID) {
+    const canState  = d[1];
+    const claimedSA = d[2];
+    const uptimeS   = d[3] | (d[4] << 8);
+    const rxFrameCount = d[5] | (d[6] << 8);
+    const dropCount = d[7];
+
+    _localBusBroadcast({
+      type: 'busstate', canState, claimedSA, uptimeS, rxFrameCount, dropCount,
+    });
+    return true;
+  }
+
+  if (frame.id === DIAG2_CAN_ID) {
+    _localBusBroadcast({
+      type: 'busstate', txErrCnt: d[1], rxErrCnt: d[2], canState: d[3],
+    });
+    return true;
+  }
+
+  if (frame.id === ALARM_BTN_CAN_ID) {
+    console.log('[ALARM] cancel-button event received');
+    _localBusBroadcast({ type: 'button' });
+    return true;
+  }
+
+  return false;
+}
+
 function handleFrame(frame) {
   if (!frame.ext) return;
+  if (handleDiagFrame(frame)) return;
 
   const pgn  = canIdToPgn(frame.id);
   const src  = frame.id & 0xFF;
@@ -655,6 +817,7 @@ async function run() {
   const spiDev = await openSpi(SPI_DEV);
 
   await connectSK();
+  setupLocalBus();
 
   /* Config is pushed dynamically when the STM32 is detected online
    * (see scheduleConfigPush / parseRxBlock above). No static timers needed. */

@@ -165,4 +165,28 @@ int n2k_negotiate_address(const struct device *can_dev);
  *  address claiming failed. */
 uint8_t n2k_sa_get(void);
 
+/**
+ * Broadcast an ISO Request (PGN 59904, global destination) for the given
+ * PGN. Standard ISO 11783 / N2K mechanism for soliciting a response from
+ * any device on the bus, including ones that only transmit at their own
+ * power-on (e.g. passive instrument displays) — every device is required
+ * to respond to a global request for its own Address Claim (PGN 60928),
+ * so this is how a bus/device monitor discovers devices that were already
+ * up and settled before this node started listening, without needing
+ * them power-cycled.
+ *
+ * Only usable after n2k_negotiate_address() has completed (needs a valid
+ * source address to send from).
+ */
+void n2k_send_iso_request(uint32_t requested_pgn);
+
+/** Convenience wrapper: n2k_send_iso_request(N2K_PGN_ISO_ADDR_CLAIM). */
+void n2k_discover_devices(void);
+
+/** Convenience wrapper: n2k_send_iso_request(N2K_PGN_PRODUCT_INFO).
+ *  Broadcast so every device that implements it replies with PGN 126996
+ *  (model/serial/software info) — lets bus-monitor-server.js auto-populate
+ *  a device's real name instead of just its manufacturer. */
+void n2k_request_product_info(void);
+
 #endif /* N2K_H_ */

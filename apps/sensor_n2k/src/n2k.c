@@ -1,5 +1,6 @@
 #include "n2k.h"
 #include "sensor_config.h"
+#include "spi_bridge.h"
 
 #include <errno.h>
 #include <string.h>
@@ -290,6 +291,25 @@ CAN_MSGQ_DEFINE(n2k_mgmt_q, 16);
 K_THREAD_STACK_DEFINE(n2k_mgmt_stack, MGMT_STACK_SIZE);
 static struct k_thread n2k_mgmt_td;
 
+/*
+ * Periodic background device-discovery poll — deliberately slow (this is
+ * not needed for normal operation, mgmt_fn() above already answers any
+ * ISO Request addressed to us, and every device's own address-claim
+ * handling is fully event-driven). Exists only to catch devices that were
+ * already up and settled on the bus before this node started listening
+ * (e.g. a passive instrument display that only transmits its own Address
+ * Claim at its own power-on). See n2k_discover_devices() below for the
+ * on-demand trigger (CFG_PARAM_DISCOVER_DEVICES, from the bus-monitor
+ * webapp's "Discover Devices" button via sensor_config.c) for whenever a
+ * several-minute wait isn't wanted.
+ */
+#define DISCOVER_INTERVAL   K_MINUTES(3)
+#define DISCOVER_STACK_SIZE 768
+
+K_THREAD_STACK_DEFINE(discover_stack, DISCOVER_STACK_SIZE);
+static struct k_thread discover_td;
+static void discover_fn(void *a, void *b, void *c);
+
 /* ------------------------------------------------------------------ */
 /* PGN 126996 – Product Information (NMEA 2000 Fast Packet)            */
 /* ------------------------------------------------------------------ */
@@ -387,6 +407,14 @@ static void mgmt_fn(void *a, void *b, void *c)
 	while (1) {
 		k_msgq_get(&n2k_mgmt_q, &rx, K_FOREVER);
 		LED4B_BLINK(1);   /* any mgmt frame (PGN 60928 or 59904) received */
+
+		/* claim_filt/req_filt sit at lower filter indices than the
+		 * catch-all (spi_bridge_attach_rx()), so M_CAN routes every
+		 * Address Claim / ISO Request on the bus here first — the
+		 * catch-all never sees them. Without this, bus-monitor-server.js
+		 * can never learn about a device (e.g. a passive instrument
+		 * display) whose only traffic is its own Address Claim. */
+		spi_bridge_enqueue(&rx);
 
 		uint8_t pf  = (uint8_t)((rx.id >> 16) & 0xFFU);
 		uint8_t dst = (uint8_t)((rx.id >>  8) & 0xFFU);
@@ -609,12 +637,59 @@ int n2k_negotiate_address(const struct device *can_dev)
 			MGMT_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&n2k_mgmt_td, "n2k_mgmt");
 
+	k_thread_create(&discover_td, discover_stack, DISCOVER_STACK_SIZE,
+			discover_fn, NULL, NULL, NULL,
+			MGMT_PRIO, 0, K_NO_WAIT);
+	k_thread_name_set(&discover_td, "n2k_discover");
+
 	return 0;
 }
 
 uint8_t n2k_sa_get(void)
 {
 	return g_sa;
+}
+
+void n2k_send_iso_request(uint32_t requested_pgn)
+{
+	struct can_frame f = {0};
+
+	f.id      = pdu1_id(0xEAU, N2K_ADDR_GLOBAL, g_sa);
+	f.flags   = CAN_FRAME_IDE;
+	f.dlc     = 8;
+	f.data[0] = (uint8_t)(requested_pgn & 0xFFU);
+	f.data[1] = (uint8_t)((requested_pgn >> 8) & 0xFFU);
+	f.data[2] = (uint8_t)((requested_pgn >> 16) & 0xFFU);
+	for (int i = 3; i < 8; i++) {
+		f.data[i] = 0xFFU;   /* pad, standard ISO 11783/N2K convention */
+	}
+	can_send(s_can, &f, K_MSEC(100), NULL, NULL);
+}
+
+void n2k_discover_devices(void)
+{
+	LOG_INF("N2K: broadcasting ISO Request for PGN 60928 (device discovery)");
+	n2k_send_iso_request(N2K_PGN_ISO_ADDR_CLAIM);
+}
+
+void n2k_request_product_info(void)
+{
+	LOG_INF("N2K: broadcasting ISO Request for PGN 126996 (product info)");
+	n2k_send_iso_request(N2K_PGN_PRODUCT_INFO);
+}
+
+static void discover_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+
+	while (1) {
+		k_sleep(DISCOVER_INTERVAL);
+		n2k_discover_devices();
+		/* Space the two broadcast requests apart so replies don't
+		 * all contend for the bus at once. */
+		k_sleep(K_SECONDS(2));
+		n2k_request_product_info();
+	}
 }
 
 int n2k_send_frame(const struct can_frame *frame)

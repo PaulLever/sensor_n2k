@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@canboat/canboatjs": "^3.20.0",
+    "@canboat/ts-pgns": "^1.0.0",
     "spi-device": "^3.0.0",
     "ws": "^8.0.0"
   }

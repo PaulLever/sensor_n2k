@@ -1,0 +1,17 @@
+[Unit]
+Description=sensor_n2k Bus/Device Monitor (port 3003)
+After=sensor-n2k-bridge.service
+Wants=sensor-n2k-bridge.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/bus-monitor-server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

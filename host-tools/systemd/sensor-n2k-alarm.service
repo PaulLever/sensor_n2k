@@ -1,0 +1,31 @@
+[Unit]
+Description=sensor_n2k Alarm Engine (port 3002)
+After=sensor-n2k-bridge.service
+Wants=sensor-n2k-bridge.service
+
+[Service]
+Type=simple
+# NOT root, unlike sensor-n2k-bridge.service/sensor-n2k-config.service.
+# BlueZ/PipeWire audio playback needs the session-owning user's D-Bus /
+# XDG_RUNTIME_DIR (confirmed on-device: audio stack here is PipeWire, not
+# PulseAudio — pipewire.service is a *user* service). Matches
+# sensor-n2k-signalk.service's User=arduino for the same reason.
+#
+# PipeWire's user service only starts automatically at boot if lingering
+# is enabled for this user (`loginctl enable-linger arduino` — otherwise
+# it only exists while an interactive session, e.g. SSH, is active). Done
+# during this session; confirm with `loginctl show-user arduino` if this
+# service ever can't reach audio after a fresh boot.
+User=arduino
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
+EnvironmentFile=-/etc/sensor_n2k/signalk.env
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/alarm-server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

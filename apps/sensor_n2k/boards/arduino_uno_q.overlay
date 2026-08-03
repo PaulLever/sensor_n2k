@@ -34,6 +34,24 @@
 		//??pc0_gpios = <&gpiob 0 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 		pc0_gpios = <&gpiob 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		pc1_gpios = <&gpiob 1 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
+
+		/*
+		 * Alarm buzzer/LED/cancel-button — PLACEHOLDER pins pending real
+		 * wiring confirmation (physical bring-up is not part of initial
+		 * alarm-feature testing; Bluetooth speaker output is tested
+		 * first). GPIOF was the original plan but has no devicetree node
+		 * in Zephyr's STM32U5 support at all — see alarm_io.h for the
+		 * full explanation. Using GPIOH instead: already enabled below,
+		 * PH0-PH2 aren't claimed by anything else on this board (PH10-15
+		 * are the on-board status LEDs in arduino_uno_q-common.dtsi).
+		 * This block is shared with the MCP2515 overlay variant too —
+		 * EXTRA_DTC_OVERLAY_FILE in CMakeLists.txt merges onto this same
+		 * zephyr_user node rather than replacing it, so no duplicate
+		 * block is needed in arduino_uno_q_mcp2515.overlay.
+		 */
+		alarm_buzzer_gpios = <&gpioh 0 GPIO_ACTIVE_HIGH>;
+		alarm_led_gpios    = <&gpioh 1 GPIO_ACTIVE_HIGH>;
+		alarm_button_gpios = <&gpioh 2 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 
 	/*

@@ -23,17 +23,22 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 /* N2K_PGNCFG_* (must match sensor_config.h and bridge.js) */
 const PGNCFG = { TEMP: 0, TEMP_EXT: 1, ENV_PARAMS: 2, ENGINE_DYN: 3 };
 
+/* Default alarm sub-object — consumed only by alarm-server.js's
+ * default-rule sync, never pushed to the STM32 (see plan note: these
+ * ranges are a host-side-only concept). */
+function defaultAlarm() { return { enabled: false, min_c: null, max_c: null }; }
+
 const DEFAULT_CONFIG = {
   onewire: {
     poll_ms: 2000,
     slots: [
-      { enabled: true,  pgn_id: PGNCFG.TEMP, source: 2, instance: 1, test_mode: false, test_value_c: 20.0 },
-      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 2, test_mode: false, test_value_c: 20.0 },
-      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 3, test_mode: false, test_value_c: 20.0 },
-      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 4, test_mode: false, test_value_c: 20.0 },
+      { enabled: true,  pgn_id: PGNCFG.TEMP, source: 2, instance: 1, test_mode: false, test_value_c: 20.0, alarm: defaultAlarm() },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 2, test_mode: false, test_value_c: 20.0, alarm: defaultAlarm() },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 3, test_mode: false, test_value_c: 20.0, alarm: defaultAlarm() },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 4, test_mode: false, test_value_c: 20.0, alarm: defaultAlarm() },
     ],
   },
-  adc:   { enabled: true, pgn_id: PGNCFG.TEMP_EXT, source: 14, instance: 0, poll_ms: 1000, test_mode: false, test_value_c: 20.0 },
+  adc:   { enabled: true, pgn_id: PGNCFG.TEMP_EXT, source: 14, instance: 0, poll_ms: 1000, test_mode: false, test_value_c: 20.0, alarm: defaultAlarm() },
   pulse: [
     { enabled: false, mode: 'STW', hz_per_mps: 9.33,  update_ms: 1000, avg_samples: 5 },
     { enabled: false, mode: 'RPM', pulses_per_rev: 1.0, engine_instance: 0, update_ms: 500, avg_samples: 3 },
@@ -68,6 +73,7 @@ function migrateConfig(cfg) {
     if (s.pgn_id === undefined)     { s.pgn_id = PGNCFG.TEMP; }
     if (s.test_mode === undefined)  { s.test_mode = false; }
     if (s.test_value_c === undefined) { s.test_value_c = 20.0; }
+    if (s.alarm === undefined)      { s.alarm = defaultAlarm(); }
   });
   cfg.onewire.slots = slots;
   /* Ensure adc has pgn_id and test fields */
@@ -75,6 +81,7 @@ function migrateConfig(cfg) {
     if (cfg.adc.pgn_id === undefined)     { cfg.adc.pgn_id = PGNCFG.TEMP_EXT; }
     if (cfg.adc.test_mode === undefined)  { cfg.adc.test_mode = false; }
     if (cfg.adc.test_value_c === undefined) { cfg.adc.test_value_c = 20.0; }
+    if (cfg.adc.alarm === undefined)      { cfg.adc.alarm = defaultAlarm(); }
   }
   return cfg;
 }
@@ -140,6 +147,14 @@ var HTML = '<!DOCTYPE html>\n'
   + '    <div><label><input type="checkbox" id="ow0_test_en"> TEST mode (use fixed value)</label></div>\n'
   + '    <div><label>Test value (°C)</label><input type="number" id="ow0_test_val" step="0.1" min="-55" max="1000" value="20"></div>\n'
   + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div><label><input type="checkbox" id="ow0_alarm_en"> Alarm enabled</label></div>\n'
+  + '    <div><label>Threshold</label><select id="ow0_alarm_mode" onchange="onAlarmModeChange(\'ow0_\')"><option value="max">Max</option><option value="min">Min</option><option value="both">Both</option></select></div>\n'
+  + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div id="ow0_alarm_min_label"><label>Alarm min (°C)</label><input type="number" id="ow0_alarm_min" step="0.1"></div>\n'
+  + '    <div id="ow0_alarm_max_label"><label>Alarm max (°C)</label><input type="number" id="ow0_alarm_max" step="0.1"></div>\n'
+  + '  </div>\n'
   + '  </details>\n'
   + '  <details><summary>Slot 1 — second DS18B20</summary>\n'
   + '  <div class="row">\n'
@@ -151,6 +166,14 @@ var HTML = '<!DOCTYPE html>\n'
   + '  <div class="row">\n'
   + '    <div><label><input type="checkbox" id="ow1_test_en"> TEST mode (use fixed value)</label></div>\n'
   + '    <div><label>Test value (°C)</label><input type="number" id="ow1_test_val" step="0.1" min="-55" max="1000" value="20"></div>\n'
+  + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div><label><input type="checkbox" id="ow1_alarm_en"> Alarm enabled</label></div>\n'
+  + '    <div><label>Threshold</label><select id="ow1_alarm_mode" onchange="onAlarmModeChange(\'ow1_\')"><option value="max">Max</option><option value="min">Min</option><option value="both">Both</option></select></div>\n'
+  + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div id="ow1_alarm_min_label"><label>Alarm min (°C)</label><input type="number" id="ow1_alarm_min" step="0.1"></div>\n'
+  + '    <div id="ow1_alarm_max_label"><label>Alarm max (°C)</label><input type="number" id="ow1_alarm_max" step="0.1"></div>\n'
   + '  </div>\n'
   + '  </details>\n'
   + '  <details><summary>Slot 2 — third DS18B20</summary>\n'
@@ -164,6 +187,14 @@ var HTML = '<!DOCTYPE html>\n'
   + '    <div><label><input type="checkbox" id="ow2_test_en"> TEST mode (use fixed value)</label></div>\n'
   + '    <div><label>Test value (°C)</label><input type="number" id="ow2_test_val" step="0.1" min="-55" max="1000" value="20"></div>\n'
   + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div><label><input type="checkbox" id="ow2_alarm_en"> Alarm enabled</label></div>\n'
+  + '    <div><label>Threshold</label><select id="ow2_alarm_mode" onchange="onAlarmModeChange(\'ow2_\')"><option value="max">Max</option><option value="min">Min</option><option value="both">Both</option></select></div>\n'
+  + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div id="ow2_alarm_min_label"><label>Alarm min (°C)</label><input type="number" id="ow2_alarm_min" step="0.1"></div>\n'
+  + '    <div id="ow2_alarm_max_label"><label>Alarm max (°C)</label><input type="number" id="ow2_alarm_max" step="0.1"></div>\n'
+  + '  </div>\n'
   + '  </details>\n'
   + '  <details><summary>Slot 3 — fourth DS18B20</summary>\n'
   + '  <div class="row">\n'
@@ -175,6 +206,14 @@ var HTML = '<!DOCTYPE html>\n'
   + '  <div class="row">\n'
   + '    <div><label><input type="checkbox" id="ow3_test_en"> TEST mode (use fixed value)</label></div>\n'
   + '    <div><label>Test value (°C)</label><input type="number" id="ow3_test_val" step="0.1" min="-55" max="1000" value="20"></div>\n'
+  + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div><label><input type="checkbox" id="ow3_alarm_en"> Alarm enabled</label></div>\n'
+  + '    <div><label>Threshold</label><select id="ow3_alarm_mode" onchange="onAlarmModeChange(\'ow3_\')"><option value="max">Max</option><option value="min">Min</option><option value="both">Both</option></select></div>\n'
+  + '  </div>\n'
+  + '  <div class="row">\n'
+  + '    <div id="ow3_alarm_min_label"><label>Alarm min (°C)</label><input type="number" id="ow3_alarm_min" step="0.1"></div>\n'
+  + '    <div id="ow3_alarm_max_label"><label>Alarm max (°C)</label><input type="number" id="ow3_alarm_max" step="0.1"></div>\n'
   + '  </div>\n'
   + '  </details>\n'
   + '</fieldset>\n'
@@ -192,6 +231,14 @@ var HTML = '<!DOCTYPE html>\n'
   + '<div class="row">\n'
   + '  <div><label><input type="checkbox" id="adc_test_en"> TEST mode (use fixed value)</label></div>\n'
   + '  <div><label>Test value (°C)</label><input type="number" id="adc_test_val" step="0.1" min="-55" max="1000" value="20"></div>\n'
+  + '</div>\n'
+  + '<div class="row">\n'
+  + '  <div><label><input type="checkbox" id="adc_alarm_en"> Alarm enabled</label></div>\n'
+  + '  <div><label>Threshold</label><select id="adc_alarm_mode" onchange="onAlarmModeChange(\'adc_\')"><option value="max">Max</option><option value="min">Min</option><option value="both">Both</option></select></div>\n'
+  + '</div>\n'
+  + '<div class="row">\n'
+  + '  <div id="adc_alarm_min_label"><label>Alarm min (°C)</label><input type="number" id="adc_alarm_min" step="0.1"></div>\n'
+  + '  <div id="adc_alarm_max_label"><label>Alarm max (°C)</label><input type="number" id="adc_alarm_max" step="0.1"></div>\n'
   + '</div>\n'
   + '</fieldset>\n'
 
@@ -287,6 +334,14 @@ var HTML = '<!DOCTYPE html>\n'
   + 'function setupPgnListener(prefix){\n'
   + '  g(prefix+"pgn").addEventListener("change",function(){onPgnChange(prefix);});\n'
   + '}\n'
+  /* Show only the relevant Alarm min/max input(s) — a sensor alarm is
+   * almost always a single bound (over-temp OR under-temp), rarely both. */
+  + 'function onAlarmModeChange(prefix){\n'
+  + '  var mode=g(prefix+"alarm_mode").value;\n'
+  + '  g(prefix+"alarm_min_label").style.display=(mode==="min"||mode==="both")?"":"none";\n'
+  + '  g(prefix+"alarm_max_label").style.display=(mode==="max"||mode==="both")?"":"none";\n'
+  + '}\n'
+  + 'function alarmModeFor(a){return(a.min_c!=null&&a.max_c!=null)?"both":(a.min_c!=null?"min":"max");}\n'
   /* Load config from server */
   + 'fetch("/api/config").then(function(r){return r.json();}).then(function(c){\n'
   + '  g("ow_poll").value=c.onewire.poll_ms;\n'
@@ -299,6 +354,12 @@ var HTML = '<!DOCTYPE html>\n'
   + '    g("ow"+i+"_inst").value=s.instance;\n'
   + '    g("ow"+i+"_test_en").checked=!!s.test_mode;\n'
   + '    g("ow"+i+"_test_val").value=s.test_value_c!=null?s.test_value_c:20;\n'
+  + '    var sa=s.alarm||{};\n'
+  + '    g("ow"+i+"_alarm_en").checked=!!sa.enabled;\n'
+  + '    g("ow"+i+"_alarm_min").value=sa.min_c!=null?sa.min_c:"";\n'
+  + '    g("ow"+i+"_alarm_max").value=sa.max_c!=null?sa.max_c:"";\n'
+  + '    g("ow"+i+"_alarm_mode").value=alarmModeFor(sa);\n'
+  + '    onAlarmModeChange("ow"+i+"_");\n'
   + '    setupPgnListener("ow"+i+"_");\n'
   + '  });\n'
   + '  var ap=c.adc.pgn_id||1;\n'
@@ -309,6 +370,12 @@ var HTML = '<!DOCTYPE html>\n'
   + '  g("adc_poll").value=c.adc.poll_ms;\n'
   + '  g("adc_test_en").checked=!!c.adc.test_mode;\n'
   + '  g("adc_test_val").value=c.adc.test_value_c!=null?c.adc.test_value_c:20;\n'
+  + '  var aa=c.adc.alarm||{};\n'
+  + '  g("adc_alarm_en").checked=!!aa.enabled;\n'
+  + '  g("adc_alarm_min").value=aa.min_c!=null?aa.min_c:"";\n'
+  + '  g("adc_alarm_max").value=aa.max_c!=null?aa.max_c:"";\n'
+  + '  g("adc_alarm_mode").value=alarmModeFor(aa);\n'
+  + '  onAlarmModeChange("adc_");\n'
   + '  setupPgnListener("adc_");\n'
   + '  [0,1].forEach(function(i){\n'
   + '    var p=c.pulse[i];\n'
@@ -322,13 +389,24 @@ var HTML = '<!DOCTYPE html>\n'
   + '  });\n'
   + '});\n'
   /* Save handler */
+  /* Gate min_c/max_c by the Threshold selector — matches alarmModeFor()
+   * on load, so re-saving without touching the alarm block round-trips. */
+  + 'function alarmFor(prefix){\n'
+  + '  var mode=g(prefix+"alarm_mode").value;\n'
+  + '  var minV=g(prefix+"alarm_min").value, maxV=g(prefix+"alarm_max").value;\n'
+  + '  return{enabled:g(prefix+"alarm_en").checked,\n'
+  + '    min_c:(mode==="min"||mode==="both")&&minV!==""?+minV:null,\n'
+  + '    max_c:(mode==="max"||mode==="both")&&maxV!==""?+maxV:null};\n'
+  + '}\n'
   + 'g("f").addEventListener("submit",function(e){\n'
   + '  e.preventDefault();\n'
   + '  var c={\n'
   + '    onewire:{poll_ms:+g("ow_poll").value,slots:[0,1,2,3].map(function(i){\n'
-  + '      return{enabled:g("ow"+i+"_en").checked,pgn_id:+g("ow"+i+"_pgn").value,source:+g("ow"+i+"_src").value,instance:+g("ow"+i+"_inst").value,test_mode:g("ow"+i+"_test_en").checked,test_value_c:+g("ow"+i+"_test_val").value};\n'
+  + '      return{enabled:g("ow"+i+"_en").checked,pgn_id:+g("ow"+i+"_pgn").value,source:+g("ow"+i+"_src").value,instance:+g("ow"+i+"_inst").value,test_mode:g("ow"+i+"_test_en").checked,test_value_c:+g("ow"+i+"_test_val").value,'
+  + '        alarm:alarmFor("ow"+i+"_")};\n'
   + '    })},\n'
-  + '    adc:{enabled:g("adc_en").checked,pgn_id:+g("adc_pgn").value,source:+g("adc_src").value,instance:+g("adc_inst").value,poll_ms:+g("adc_poll").value,test_mode:g("adc_test_en").checked,test_value_c:+g("adc_test_val").value},\n'
+  + '    adc:{enabled:g("adc_en").checked,pgn_id:+g("adc_pgn").value,source:+g("adc_src").value,instance:+g("adc_inst").value,poll_ms:+g("adc_poll").value,test_mode:g("adc_test_en").checked,test_value_c:+g("adc_test_val").value,'
+  + '      alarm:alarmFor("adc_")},\n'
   + '    pulse:[0,1].map(function(i){return{enabled:g("pc"+i+"_en").checked,mode:g("pc"+i+"_mode").value,hz_per_mps:+g("pc"+i+"_hz").value,pulses_per_rev:+g("pc"+i+"_ppr").value,engine_instance:+g("pc"+i+"_eng").value,update_ms:+g("pc"+i+"_upd").value,avg_samples:+g("pc"+i+"_avg").value};})\n'
   + '  };\n'
   + '  fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(c)})\n'

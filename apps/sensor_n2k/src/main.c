@@ -4,6 +4,7 @@
 #include "pulse_counter.h"
 #include "sensor_config.h"
 #include "spi_bridge.h"
+#include "alarm_io.h"
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -293,6 +294,8 @@ int main(void)
 	init_leds();
 	led3r_blink(10);
 	led4g_blink(10);
+
+	alarm_io_init();
 
 
 #if 0

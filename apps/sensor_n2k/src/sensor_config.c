@@ -1,4 +1,5 @@
 #include "sensor_config.h"
+#include "alarm_io.h"
 
 #include <string.h>
 #include <zephyr/settings/settings.h>
@@ -238,6 +239,14 @@ void sensor_config_update(uint8_t param_id, const uint8_t *d, uint8_t len)
         if (len >= 2) { g_sensor_cfg.pulse[1].update_ms = bytes_to_u16_le(d); }
         break;
     case CFG_PARAM_PC1_AVG:      g_sensor_cfg.pulse[1].avg_samples = d[0]; break;
+    /* Alarm hardware I/O — transient, not persisted */
+    case CFG_PARAM_ALARM_BUZZER:
+        alarm_io_set_buzzer(d[0], (len >= 2) ? d[1] : 0);
+        break;
+    case CFG_PARAM_ALARM_LED:    alarm_io_set_led(d[0]); break;
+    case CFG_PARAM_ALARM_STOP:   alarm_io_stop_all(); break;
+    case CFG_PARAM_DISCOVER_DEVICES: n2k_discover_devices(); break;
+    case CFG_PARAM_REQUEST_PRODUCT_INFO: n2k_request_product_info(); break;
     /* Persist */
     case CFG_PARAM_SAVE_NVS:     sensor_config_save(); break;
     default: break;

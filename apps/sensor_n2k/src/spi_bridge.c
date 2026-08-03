@@ -289,8 +289,18 @@ static void bridge_thread(void *a, void *b, void *c)
  *         spi_bridge_drop_count(). Previously "Last ISO Request TX
  *         result", a field nothing ever actually wrote (always read back
  *         0xFF="not sent"); repurposed rather than leaving it dead.
+ *
+ * A second frame on DIAG2_CAN_ID carries what didn't fit above — the raw
+ * CAN bus error counters, needed to tell error-passive/bus-off apart from
+ * a healthy bus rather than just inferring it from `cs` alone:
+ *   [0] 0x45 ('E') — diagnostic-2 magic
+ *   [1] TX error counter (struct can_bus_err_cnt.tx_err_cnt)
+ *   [2] RX error counter (struct can_bus_err_cnt.rx_err_cnt)
+ *   [3] CAN state — redundant with DIAG_CAN_ID's [1], cheap to include
+ *   [4..7] reserved
  */
 #define DIAG_CAN_ID   0x1EFFFEFUL
+#define DIAG2_CAN_ID  0x1EFFFEEUL
 #define DIAG_INTERVAL K_SECONDS(2)
 
 K_THREAD_STACK_DEFINE(diag_stack, 1024);
@@ -304,7 +314,9 @@ static void diag_thread(void *a, void *b, void *c)
 		k_sleep(DIAG_INTERVAL);
 
 		enum can_state cs = CAN_STATE_STOPPED;
-		can_get_state(s_can_dev, &cs, NULL);
+		struct can_bus_err_cnt err_cnt = {0};
+
+		can_get_state(s_can_dev, &cs, &err_cnt);
 
 		uint32_t up_s = (uint32_t)(k_uptime_get() / 1000U);
 		uint16_t rxc  = (uint16_t)atomic_get(&s_rx_count);
@@ -323,6 +335,20 @@ static void diag_thread(void *a, void *b, void *c)
 		f.data[7] = (uint8_t)spi_bridge_drop_count();
 
 		spi_bridge_enqueue(&f);
+
+		/* Extended stats: bus-off/error-passive detection needs the raw
+		 * TEC/REC counters, which DIAG_CAN_ID above has no spare byte for.
+		 */
+		struct can_frame f2 = {0};
+
+		f2.id      = DIAG2_CAN_ID;
+		f2.flags   = CAN_FRAME_IDE;
+		f2.dlc     = 8;
+		f2.data[0] = 0x45U;
+		f2.data[1] = err_cnt.tx_err_cnt;
+		f2.data[2] = err_cnt.rx_err_cnt;
+		f2.data[3] = (uint8_t)cs;   /* redundant with DIAG_CAN_ID, cheap to include */
+		spi_bridge_enqueue(&f2);
 	}
 }
 
