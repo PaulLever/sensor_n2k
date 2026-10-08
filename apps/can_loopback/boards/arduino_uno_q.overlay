@@ -1,0 +1,46 @@
+/*
+ * Enable FDCAN1 on the Arduino UNO Q (STM32U585) for loopback testing.
+ *
+ * Clock and pins ported from apps/sensor_n2k, the only app on this board
+ * whose FDCAN1 config has been proven against a real N2K bus:
+ *
+ *   - Kernel clock: HSE (16 MHz), not the original PLL1_Q. Without an
+ *     explicit second `clocks` entry at all, the STM32 FDCAN driver
+ *     silently assumes the 160 MHz APB1_2 bus clock for its bit-timing
+ *     math while the hardware mux (FDCANSEL, reset default 00=HSE)
+ *     actually runs the peripheral from HSE — a 10x bitrate error (25
+ *     kbit/s instead of 250) that loopback mode can't detect, since it
+ *     never validates against an external clock reference. PLL1_Q here
+ *     was likewise unverified against a real bus. HSE is what
+ *     sensor_n2k measured and confirmed correct on this exact board.
+ *   - Pins: PB8 (RX) / PB9 (TX), not PD0/PD1. This board's CAN pins are
+ *     heavily muxed and PD0/PD1 has a known potential conflict with
+ *     USB/BLE; PB8/PB9 is the pair sensor_n2k already uses successfully
+ *     with the real transceiver on this board. PB9 collides with the
+ *     board's default SPI2 NSS pin, hence disabling &spi2 below (same
+ *     fix sensor_n2k's overlay carries for the same reason).
+ *
+ * On-chip CAN_MODE_LOOPBACK doesn't require a transceiver or external
+ * wiring, but the dt binding still requires pinctrl-0.
+ *
+ * zephyr,canbus chosen so the can shell / DEVICE_DT_GET(DT_CHOSEN(...)) works.
+ */
+
+/ {
+	chosen {
+		zephyr,canbus = &fdcan1;
+	};
+};
+
+/* Board dtsi enables SPI2 with NSS on PB9, which would fight FDCAN1_TX. */
+&spi2 {
+	status = "disabled";
+};
+
+&fdcan1 {
+	clocks = <&rcc STM32_CLOCK(APB1_2, 9)>,
+		 <&rcc STM32_SRC_HSE FDCAN1_SEL(0)>;
+	pinctrl-0 = <&fdcan1_rx_pb8 &fdcan1_tx_pb9>;
+	pinctrl-names = "default";
+	status = "okay";
+};

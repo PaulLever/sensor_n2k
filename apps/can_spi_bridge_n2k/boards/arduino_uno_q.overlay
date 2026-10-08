@@ -1,0 +1,49 @@
+/*
+ * NMEA 2000 CAN<->SPI bridge overlay for the Arduino UNO Q (STM32U585).
+ *
+ * NMEA 2000 is CLASSIC CAN 2.0B at 250 kbit/s with 29-bit extended IDs --
+ * NOT CAN FD. So this overlay configures only the single (arbitration) bitrate
+ * at 250000 and omits the FD data-phase properties entirely. The firmware runs
+ * the controller in classic mode (no CAN_MODE_FD) and tags frames as extended.
+ *
+ *  - FDCAN1 @ 250 kbit/s classic (kernel clock HSE, pins PB8/PB9).
+ *  - SPI3 as SPI slave (board-default pins), QCM /dev/spidev0.0 master.
+ *
+ * Clock and pins ported from apps/sensor_n2k, the only app on this board
+ * whose FDCAN1 config has been proven against a real N2K bus — see
+ * apps/can_loopback's overlay for the full explanation (same fix, same
+ * reasoning: PLL1_Q/PD0-PD1 here were never validated against a real bus,
+ * loopback mode can't detect a 10x bitrate error, and PD0/PD1 has a known
+ * possible USB/BLE conflict on this board). &spi2 is disabled because its
+ * default NSS pin is PB9, which would otherwise fight FDCAN1_TX.
+ *
+ * For a REAL N2K bus a CAN transceiver must be wired to PB8(RX)/PB9(TX) and
+ * the firmware built in normal (non-loopback) mode -- see the BENCH_LOOPBACK
+ * switch in src/main.c. As shipped it is loopback for bench/bringup without
+ * hardware.
+ */
+
+/ {
+	chosen {
+		zephyr,canbus = &fdcan1;
+	};
+
+	zephyr,user {
+		rdy-gpios = <&gpiog 13 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&spi2 {
+	status = "disabled";
+};
+
+&fdcan1 {
+	clocks = <&rcc STM32_CLOCK(APB1_2, 9)>,
+		 <&rcc STM32_SRC_HSE FDCAN1_SEL(0)>;
+	pinctrl-0 = <&fdcan1_rx_pb8 &fdcan1_tx_pb9>;
+	pinctrl-names = "default";
+	/* NMEA 2000: classic CAN, 250 kbit/s, sample point 87.5%. No FD/BRS. */
+	bitrate = <250000>;
+	sample-point = <875>;
+	status = "okay";
+};
