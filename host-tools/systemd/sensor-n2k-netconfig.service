@@ -1,0 +1,36 @@
+[Unit]
+Description=sensor_n2k Network Setup (port 3005)
+# NetworkManager is the whole point of this service — every operation it
+# performs is an nmcli call. Starting before NM is up means the boot
+# auto-fallback would see "wlan0 unavailable" and immediately raise the
+# setup access point on a board that was about to join its normal network
+# perfectly well.
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Root, matching sensor-n2k-bridge.service (NOT the User=arduino +
+# XDG_RUNTIME_DIR convention used by alarm/portal/signalk, which exists
+# only to reach the desktop session's D-Bus for Bluetooth/audio).
+#
+# Root is required here for three separate reasons:
+#   1. nmcli connection add/modify/up/delete are privileged operations.
+#   2. `systemd-run --unit=netconfig-revert` must land on the SYSTEM
+#      manager, not a user manager, so the revert watchdog survives this
+#      service dying mid-switch.
+#   3. Raising a NetworkManager hotspot reconfigures the interface and
+#      installs NAT/DHCP for ipv4.method=shared.
+# Because the service itself is root, NO sudo and NO sudoers rule are
+# involved anywhere in netconfig-server.js — unlike sensor-n2k-ota.service,
+# which does need one.
+User=root
+WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/netconfig-server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

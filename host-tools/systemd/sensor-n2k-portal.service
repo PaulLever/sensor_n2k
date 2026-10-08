@@ -1,0 +1,34 @@
+[Unit]
+Description=sensor_n2k Portal (port 80)
+After=sensor-n2k-alarm.service network-online.target
+Wants=sensor-n2k-alarm.service
+Requires=network-online.target
+
+[Service]
+Type=simple
+# Port 80 is a privileged port (<1024) — Linux normally requires root to
+# bind it. Instead of running this whole service as root (the precedent
+# sensor-n2k-busmonitor.service set, but overkill here — this service is
+# a read-only proxy + static page, nothing that needs root), we grant
+# /usr/bin/node the one specific capability it needs:
+#
+#   sudo setcap 'cap_net_bind_service=+ep' /usr/bin/node
+#
+# *** THIS MUST BE DONE ON EVERY FRESH BOARD IMAGE / AFTER EVERY node
+# *** REINSTALL OR UPGRADE — setcap attaches to that specific binary
+# *** file, not the package, so `apt install --reinstall nodejs` (or any
+# *** upgrade that replaces the file) silently drops it, and this
+# *** service will then fail to bind port 80 until it's re-run. Verify
+# *** with `getcap /usr/bin/node` — should print
+# *** "/usr/bin/node cap_net_bind_service=ep". MUST be included in the
+# *** install doc for this project.
+User=arduino
+WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/portal-server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

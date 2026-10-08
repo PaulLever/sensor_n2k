@@ -1,0 +1,58 @@
+[Unit]
+Description=sensor_n2k OTA Updates (port 3006)
+# Not ordered After= any sensor-n2k unit on purpose: this service RESTARTS
+# those units as part of an app update, so it must be able to run when
+# they are down or broken — that is precisely when you need it.
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+# Root, matching sensor-n2k-bridge.service (NOT the User=arduino +
+# XDG_RUNTIME_DIR convention used by alarm/portal/signalk, which exists
+# only to reach the desktop session's D-Bus for Bluetooth/audio).
+# Needed to write /opt/sensor_n2k, restart system units, and drive the
+# SWD GPIOs during a firmware flash.
+#
+# *** ONE-TIME DEVICE PREP — /etc/sudoers.d/sensor-n2k-ota ***
+#
+# Firmware flashing runs `sudo -n /home/root/zephyr-flash/ota-flash.sh`
+# (the wrapper ota-server.js regenerates on every start, containing the
+# exact OpenOCD sequence from docs/N2K-INSTALL-UNOQ.md §6e). This board's
+# sudo is NOT passwordless, and a service can never answer a password
+# prompt — so a scoped rule must exist:
+#
+#   sudo visudo -f /etc/sudoers.d/sensor-n2k-ota
+#   # then enter exactly one line (adjust the user if you change User=
+#   # above; root is the default this unit ships with):
+#   root ALL=(ALL) NOPASSWD: /home/root/zephyr-flash/ota-flash.sh
+#
+#   sudo chmod 0440 /etc/sudoers.d/sensor-n2k-ota
+#   sudo visudo -c            # MUST print "parsed OK" before you log out
+#
+# *** THIS MUST BE DONE ON EVERY FRESH BOARD IMAGE, and REDONE if the
+# *** wrapper path (FLASH_SCRIPT in ota-server.js) ever changes —
+# *** sudoers matches the literal path, so a moved or renamed script
+# *** silently falls back to a password prompt and every firmware update
+# *** fails half-way with "sudo: a password is required".
+# *** NEVER widen this to `NOPASSWD: ALL` — the whole point is that one
+# *** fixed script is privileged, not the service.
+# *** While this unit ships with User=root the rule is technically
+# *** redundant (root needs no sudoers entry) — which is exactly why it
+# *** gets skipped, and why flashing then breaks the first time anyone
+# *** de-privileges this unit. Install it anyway. ota-server.js checks
+# *** for the file at startup and warns loudly in the journal and on the
+# *** Updates page if it is missing. Same class of easily-skipped,
+# *** per-image prep as the `setcap cap_net_bind_service` requirement in
+# *** sensor-n2k-portal.service. MUST be included in the install doc —
+# *** see docs/OTA-UPDATE.md.
+User=root
+WorkingDirectory=/opt/sensor_n2k/host-tools/canboatjs-signalk
+ExecStart=/usr/bin/node /opt/sensor_n2k/host-tools/canboatjs-signalk/ota-server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

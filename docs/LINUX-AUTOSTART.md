@@ -67,7 +67,27 @@ sudo cp /opt/sensor_n2k/host-tools/systemd/*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable sensor-n2k-bridge sensor-n2k-signalk sensor-n2k-config
 sudo systemctl start  sensor-n2k-bridge sensor-n2k-signalk sensor-n2k-config
+
+# Web app suite (alarms, bus monitor, bilge, portal, network setup, updates)
+sudo systemctl enable --now sensor-n2k-alarm sensor-n2k-busmonitor \
+  sensor-n2k-bilge sensor-n2k-portal sensor-n2k-netconfig sensor-n2k-ota
 ```
+
+### One-time, per-board-image prep — services that need it
+
+Three services need a manual step that lives **outside** the repo. Each one is
+silent when skipped until the exact moment you need the feature, so do all
+three now and verify each.
+
+| Service | Step | Verify |
+|---|---|---|
+| `sensor-n2k-portal` | `sudo setcap 'cap_net_bind_service=+ep' /usr/bin/node` — **redo after every `node` reinstall/upgrade**, the capability is attached to the binary file, not the package | `getcap /usr/bin/node` → `cap_net_bind_service=ep` |
+| `sensor-n2k-ota` | Create `/etc/sudoers.d/sensor-n2k-ota` (mode 0440, via `visudo`) with the single line `root ALL=(ALL) NOPASSWD: /home/root/zephyr-flash/ota-flash.sh` — **never** `NOPASSWD: ALL`. Full instructions: [OTA-UPDATE.md](OTA-UPDATE.md#2-the-scoped-sudoers-rule--do-not-skip) | `sudo visudo -c` → `parsed OK`, then `sudo -n -l /home/root/zephyr-flash/ota-flash.sh` must not prompt |
+| `sensor-n2k-alarm` | `loginctl enable-linger arduino` (so PipeWire's user session exists at boot without an SSH login) | `loginctl show-user arduino` → `Linger=yes` |
+
+`sensor-n2k-netconfig` needs **no** prep step — it runs as root and calls
+`nmcli`/`systemd-run` directly. Just confirm NetworkManager is managing `wlan0`
+(`nmcli dev status`). See [NETWORK-SETUP.md](NETWORK-SETUP.md).
 
 ---
 
@@ -84,9 +104,18 @@ sudo journalctl -fu sensor-n2k-bridge
 Ports after start:
 | Service          | Port  | Purpose                       |
 |------------------|-------|-------------------------------|
+| Portal           | 80    | Landing page / active alarms   |
 | SignalK HTTP     | 3000  | Dashboard & WebSocket          |
 | Config web UI    | 3001  | Sensor parameter editing       |
+| Alarms           | 3002  | Rules, hardware, remote push   |
+| Bus monitor      | 3003  | Live N2K device/PGN visibility |
+| Bilge pumps      | 3004  | Cycle counts, runtime          |
+| Network          | 3005  | WiFi setup / switching         |
+| Updates          | 3006  | App + firmware OTA             |
 | SPI bridge       | —     | Background, no network port    |
+
+None of these have authentication — they are LAN-only by design. Do not expose
+any of them to the internet.
 
 Access the config UI from any browser on the same network:
 `http://192.168.86.33:3001`
