@@ -29,12 +29,14 @@
 #define MAX_OW_SENSORS 4U
 
 typedef struct {
-    bool    enabled;
-    uint8_t n2k_pgn_id;    /* N2K_PGNCFG_* */
-    uint8_t n2k_source;    /* N2K_TSRC_* (or field selector for ENGINE_DYN) */
-    uint8_t n2k_instance;  /* temperature instance / engine instance */
-    bool    test_mode;     /* inject fixed value instead of reading sensor */
-    float   test_value_c;  /* fixed temperature in °C used when test_mode=true */
+    bool     enabled;
+    uint8_t  n2k_pgn_id;    /* N2K_PGNCFG_* */
+    uint8_t  n2k_source;    /* N2K_TSRC_* (or field selector for ENGINE_DYN) */
+    uint8_t  n2k_instance;  /* temperature instance / engine instance */
+    bool     test_mode;     /* inject fixed value instead of reading sensor */
+    float    test_value_c;  /* fixed temperature in °C used when test_mode=true */
+    uint64_t rom_id;        /* bound 1-Wire ROM ID (see onewire.c); 0 = unassigned,
+                              * falls back to legacy positional matching */
 } ow_slot_cfg_t;
 
 typedef struct {
@@ -80,6 +82,30 @@ typedef struct {
 } pc_cfg_t;
 
 /* ------------------------------------------------------------------ */
+/* Bilge pump monitor config                                           */
+/*                                                                     */
+/* Firmware's job here is just to report state/cycles/on-time per      */
+/* channel (see bilge.c) and broadcast PGN 127501 — count/runtime      */
+/* alarm THRESHOLDS live host-side in alarm-server.js, same as every   */
+/* other alarm in this project (firmware reports data, the host        */
+/* applies rules), so there's nothing alarm-related to configure here. */
+/* ------------------------------------------------------------------ */
+
+#define BILGE_NUM_CHANNELS 4U
+
+typedef struct {
+    bool enabled[BILGE_NUM_CHANNELS];
+    /* PGN 127501 instance for the shared switch bank these 4 channels
+     * report into (as indicators 1-4; indicators 5-28 report N/A). */
+    uint8_t switch_bank_instance;
+    /* Shared across all 4 channels — real float switches chatter for
+     * much longer than a clean opto/electrical bounce as they bob with
+     * wave action, so this needs to be runtime-tunable against the real
+     * switch rather than a compile-time guess (see bilge.c's ISR). */
+    uint16_t debounce_ms;
+} bilge_cfg_t;
+
+/* ------------------------------------------------------------------ */
 /* Top-level sensor config                                             */
 /* ------------------------------------------------------------------ */
 
@@ -87,6 +113,7 @@ typedef struct {
     ow_cfg_t          onewire;
     temp_sensor_cfg_t adc;
     pc_cfg_t          pulse[2];
+    bilge_cfg_t       bilge;
 } sensor_cfg_t;
 
 /* ------------------------------------------------------------------ */
@@ -143,6 +170,13 @@ typedef struct {
 #define CFG_DFLT_PC1_ENG_INST    0U
 #define CFG_DFLT_PC1_UPDATE_MS   500U
 #define CFG_DFLT_PC1_AVG         3U
+
+#define CFG_DFLT_BILGE_ENABLED           false
+#define CFG_DFLT_BILGE_SWITCH_INSTANCE   1U
+/* Midpoint of the user's own estimate (1-3s) for real float-switch
+ * chatter — see bilge_cfg_t.debounce_ms; tune once real hardware is
+ * wired up. */
+#define CFG_DFLT_BILGE_DEBOUNCE_MS       2000U
 
 /* ------------------------------------------------------------------ */
 /* Runtime config frame protocol (Linux → STM32 via SPI bridge)       */
@@ -224,6 +258,31 @@ typedef struct {
  * bus-monitor-server.js can auto-populate a device's real name instead of
  * just its manufacturer. */
 #define CFG_PARAM_REQUEST_PRODUCT_INFO 0x44U
+
+/* 1-Wire ROM binding — d[0..7] = 8-byte big-endian ROM ID (all-zero =
+ * unassigned, falls back to legacy positional matching — see onewire.c's
+ * resolve_slave_index()). This is how a slot gets bound to a specific
+ * physical sensor, or rebound to a replacement's new ROM ID after a
+ * failure — see CFG_PARAM_OW_RESCAN below for how the host UI learns
+ * what ROM IDs are actually on the bus to offer as choices. */
+#define CFG_PARAM_OW0_ROM       0x45U
+#define CFG_PARAM_OW1_ROM       0x46U
+#define CFG_PARAM_OW2_ROM       0x47U
+#define CFG_PARAM_OW3_ROM       0x48U
+
+/* On-demand 1-Wire rescan — no payload. Triggers onewire_request_rescan()
+ * (re-run the ROM search, report results — see ONEWIRE_ROM_REPORT_CAN_ID
+ * in onewire.c). Also runs automatically once at boot. */
+#define CFG_PARAM_OW_RESCAN     0x49U
+
+/* Bilge pump monitor (see bilge.c / BILGE_REPORT_CAN_ID for the report
+ * side of this) */
+#define CFG_PARAM_BILGE0_ENABLED        0x4AU
+#define CFG_PARAM_BILGE1_ENABLED        0x4BU
+#define CFG_PARAM_BILGE2_ENABLED        0x4CU
+#define CFG_PARAM_BILGE3_ENABLED        0x4DU
+#define CFG_PARAM_BILGE_SWITCH_INSTANCE 0x4EU
+#define CFG_PARAM_BILGE_DEBOUNCE_MS     0x4FU  /* uint16 LE, milliseconds */
 
 /* Persist */
 #define CFG_PARAM_SAVE_NVS       0xFFU

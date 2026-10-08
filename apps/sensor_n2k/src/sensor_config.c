@@ -1,5 +1,6 @@
 #include "sensor_config.h"
 #include "alarm_io.h"
+#include "onewire.h"
 
 #include <string.h>
 #include <zephyr/settings/settings.h>
@@ -48,11 +49,22 @@ static const sensor_cfg_t g_defaults = {
             .avg_samples     = CFG_DFLT_PC1_AVG,
         },
     },
+    .bilge = {
+        .enabled = {
+            CFG_DFLT_BILGE_ENABLED, CFG_DFLT_BILGE_ENABLED,
+            CFG_DFLT_BILGE_ENABLED, CFG_DFLT_BILGE_ENABLED,
+        },
+        .switch_bank_instance = CFG_DFLT_BILGE_SWITCH_INSTANCE,
+        .debounce_ms          = CFG_DFLT_BILGE_DEBOUNCE_MS,
+    },
 };
 
-/* Version 4: added test_mode and test_value_c to ow_slot_cfg_t and temp_sensor_cfg_t */
+/* Version 7: added debounce_ms to bilge_cfg_t
+ * Version 6: added bilge_cfg_t bilge to sensor_cfg_t
+ * Version 5: added rom_id to ow_slot_cfg_t
+ * Version 4: added test_mode and test_value_c to ow_slot_cfg_t and temp_sensor_cfg_t */
 #define SCFG_NVS_KEY  "scfg/blob"
-#define SCFG_VERSION  4U
+#define SCFG_VERSION  7U
 
 typedef struct {
     uint8_t      version;
@@ -141,6 +153,19 @@ static inline uint16_t bytes_to_u16_le(const uint8_t *b)
     return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
 }
 
+/* Big-endian (not LE like the other bytes_to_* helpers here) — matches
+ * struct w1_rom's natural byte order / w1_rom_to_uint64(), so a ROM ID
+ * round-trips identically whether it's printed, sent over CAN, or stored
+ * in config, with no endian-flip anywhere in the chain. */
+static inline uint64_t bytes_to_u64_be(const uint8_t *b)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        v = (v << 8) | b[i];
+    }
+    return v;
+}
+
 void sensor_config_update(uint8_t param_id, const uint8_t *d, uint8_t len)
 {
     if (len < 1) {
@@ -157,6 +182,9 @@ void sensor_config_update(uint8_t param_id, const uint8_t *d, uint8_t len)
     case CFG_PARAM_OW0_TEST_VAL:
         if (len >= 4) { g_sensor_cfg.onewire.slot[0].test_value_c = bytes_to_float_le(d); }
         break;
+    case CFG_PARAM_OW0_ROM:
+        if (len >= 8) { g_sensor_cfg.onewire.slot[0].rom_id = bytes_to_u64_be(d); }
+        break;
     case CFG_PARAM_OW_POLL_MS:
         if (len >= 2) { g_sensor_cfg.onewire.poll_ms = bytes_to_u16_le(d); }
         break;
@@ -169,6 +197,9 @@ void sensor_config_update(uint8_t param_id, const uint8_t *d, uint8_t len)
     case CFG_PARAM_OW1_TEST_VAL:
         if (len >= 4) { g_sensor_cfg.onewire.slot[1].test_value_c = bytes_to_float_le(d); }
         break;
+    case CFG_PARAM_OW1_ROM:
+        if (len >= 8) { g_sensor_cfg.onewire.slot[1].rom_id = bytes_to_u64_be(d); }
+        break;
     /* 1-Wire slot 2 */
     case CFG_PARAM_OW2_ENABLED:  g_sensor_cfg.onewire.slot[2].enabled      = (d[0] != 0); break;
     case CFG_PARAM_OW2_SOURCE:   g_sensor_cfg.onewire.slot[2].n2k_source   = d[0];        break;
@@ -178,12 +209,18 @@ void sensor_config_update(uint8_t param_id, const uint8_t *d, uint8_t len)
     case CFG_PARAM_OW2_TEST_VAL:
         if (len >= 4) { g_sensor_cfg.onewire.slot[2].test_value_c = bytes_to_float_le(d); }
         break;
+    case CFG_PARAM_OW2_ROM:
+        if (len >= 8) { g_sensor_cfg.onewire.slot[2].rom_id = bytes_to_u64_be(d); }
+        break;
     /* 1-Wire slot 3 */
     case CFG_PARAM_OW3_ENABLED:  g_sensor_cfg.onewire.slot[3].enabled      = (d[0] != 0); break;
     case CFG_PARAM_OW3_SOURCE:   g_sensor_cfg.onewire.slot[3].n2k_source   = d[0];        break;
     case CFG_PARAM_OW3_INSTANCE: g_sensor_cfg.onewire.slot[3].n2k_instance = d[0];        break;
     case CFG_PARAM_OW3_PGN:      g_sensor_cfg.onewire.slot[3].n2k_pgn_id   = d[0];        break;
     case CFG_PARAM_OW3_TEST_EN:  g_sensor_cfg.onewire.slot[3].test_mode    = (d[0] != 0); break;
+    case CFG_PARAM_OW3_ROM:
+        if (len >= 8) { g_sensor_cfg.onewire.slot[3].rom_id = bytes_to_u64_be(d); }
+        break;
     case CFG_PARAM_OW3_TEST_VAL:
         if (len >= 4) { g_sensor_cfg.onewire.slot[3].test_value_c = bytes_to_float_le(d); }
         break;
@@ -247,6 +284,16 @@ void sensor_config_update(uint8_t param_id, const uint8_t *d, uint8_t len)
     case CFG_PARAM_ALARM_STOP:   alarm_io_stop_all(); break;
     case CFG_PARAM_DISCOVER_DEVICES: n2k_discover_devices(); break;
     case CFG_PARAM_REQUEST_PRODUCT_INFO: n2k_request_product_info(); break;
+    case CFG_PARAM_OW_RESCAN: onewire_request_rescan(); break;
+    /* Bilge pump monitor */
+    case CFG_PARAM_BILGE0_ENABLED: g_sensor_cfg.bilge.enabled[0] = (d[0] != 0); break;
+    case CFG_PARAM_BILGE1_ENABLED: g_sensor_cfg.bilge.enabled[1] = (d[0] != 0); break;
+    case CFG_PARAM_BILGE2_ENABLED: g_sensor_cfg.bilge.enabled[2] = (d[0] != 0); break;
+    case CFG_PARAM_BILGE3_ENABLED: g_sensor_cfg.bilge.enabled[3] = (d[0] != 0); break;
+    case CFG_PARAM_BILGE_SWITCH_INSTANCE: g_sensor_cfg.bilge.switch_bank_instance = d[0]; break;
+    case CFG_PARAM_BILGE_DEBOUNCE_MS:
+        if (len >= 2) { g_sensor_cfg.bilge.debounce_ms = bytes_to_u16_le(d); }
+        break;
     /* Persist */
     case CFG_PARAM_SAVE_NVS:     sensor_config_save(); break;
     default: break;
