@@ -17,6 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const WebSocket = require('ws');
+const { SHARED_STYLE, navHtml } = require('./shared-ui');
 
 let getPGNWithNumber = null;
 try {
@@ -33,8 +34,8 @@ const LOCAL_BUS_URL = 'ws://127.0.0.1:3010';
  *          customName, pgns: Map(pgn -> {count, lastSeen}) } */
 const devices = new Map();
 
-let busState = { canState: null, claimedSA: null, uptimeS: null, rxFrameCount: null,
-  dropCount: null, txErrCnt: null, rxErrCnt: null };
+let busState = { canState: null, claimedSA: null, saConfirmed: null, uptimeS: null,
+  rxFrameCount: null, dropCount: null, txErrCnt: null, rxErrCnt: null };
 
 /* ------------------------------------------------------------------ */
 /* Persistent device names                                             */
@@ -130,7 +131,7 @@ function onPgnEvent(evt) {
   let dev = devices.get(evt.src);
   if (!dev) {
     dev = { src: evt.src, lastSeen: 0, name: null, manufacturer: null,
-      uniqueNumber: null, productName: null, customName: null, pgns: new Map() };
+      uniqueNumber: null, productName: null, customName: null, deviceClass: null, pgns: new Map() };
     devices.set(evt.src, dev);
   }
   dev.lastSeen = Date.now();
@@ -149,6 +150,16 @@ function onPgnEvent(evt) {
   if (evt.pgn === 60928) {
     dev.manufacturer = evt.fields.manufacturerCode ?? evt.fields['Manufacturer Code'] ?? dev.manufacturer;
     dev.uniqueNumber = evt.fields.uniqueNumber ?? evt.fields['Unique Number'] ?? dev.uniqueNumber;
+    /* deviceClass ("Display", "Navigation", "Communication", …) is part of
+     * the SAME mandatory Address Claim every device already sends — unlike
+     * Product Info (126996), which is optional and which several real
+     * Garmin units on this exact bus were confirmed (via a live trace,
+     * repeated discovery bursts, zero response ever) to simply not
+     * implement at all. Without this, every such device collapses to the
+     * bare manufacturer name and becomes indistinguishable from every
+     * other device from the same vendor — which was the actual complaint:
+     * not "no name", but "can't tell my three Garmin units apart". */
+    dev.deviceClass = evt.fields.deviceClass ?? evt.fields['Device Class'] ?? dev.deviceClass;
   }
   if (evt.pgn === 126996) {
     const modelId = evt.fields.modelId ?? evt.fields['Model ID'] ?? dev.productName;
@@ -163,7 +174,22 @@ function onPgnEvent(evt) {
    * on this event — pick up any name learned for it on a previous run or
    * a previous source address. */
   applyPersistedName(dev);
-  dev.name = dev.customName || dev.productName || null;
+  /* productName (from PGN 126996, Product Info) only ever arrives via our
+   * own discovery request — a device that answered Address Claim (60928,
+   * effectively mandatory) but hasn't been re-asked for Product Info yet,
+   * or doesn't implement it, would otherwise show a permanently blank
+   * name. manufacturer (from the same Address Claim) is already resolved
+   * to a readable string (e.g. "Garmin") by canboatjs's own lookup, so
+   * it's a reasonable placeholder until/unless a real product name shows
+   * up — but bare manufacturer alone is indistinguishable across several
+   * same-vendor devices that don't implement Product Info (confirmed real
+   * case: 3+ Garmin units on one bus, all "Garmin"). Appending deviceClass
+   * — from the same mandatory Address Claim, not a second request — turns
+   * that into "Garmin Display" / "Garmin Navigation" / "Garmin
+   * Communication", which is enough to tell them apart without inventing
+   * a product name that was never actually broadcast. */
+  dev.name = dev.customName || dev.productName ||
+    (dev.manufacturer && dev.deviceClass ? `${dev.manufacturer} ${dev.deviceClass}` : dev.manufacturer) || null;
 }
 
 function onBusStateEvent(evt) {
@@ -206,7 +232,7 @@ function snapshot() {
     busState,
     devices: Array.from(devices.values()).map(d => ({
       src: d.src, lastSeen: d.lastSeen, name: d.name, manufacturer: d.manufacturer,
-      customName: d.customName, productName: d.productName,
+      customName: d.customName, productName: d.productName, deviceClass: d.deviceClass,
       pgnCount: d.pgns.size,
       totalFrames: Array.from(d.pgns.values()).reduce((a, p) => a + p.count, 0),
       pgns: Array.from(d.pgns.values()),
@@ -224,33 +250,55 @@ function broadcastSnapshot() {
 }
 
 const WEBAPP_HTML = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>sensor_n2k Bus Monitor</title>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sensor_n2k Bus Monitor</title>
+${SHARED_STYLE}
 <style>
-body{font-family:sans-serif;max-width:1000px;margin:2em auto;padding:0 1em}
-table{border-collapse:collapse;width:100%;margin-bottom:1em}
-th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}
-th{background:#f0f0f0}
-.health{display:flex;gap:2em;margin-bottom:1em;font-size:15px}
-.health div{background:#f5f5f5;padding:8px 14px;border-radius:6px}
-.bad{color:#c00;font-weight:bold}
-.pgns{display:none}
-tr.dev{cursor:pointer}
-</style></head>
+.pgns { display: none; }
+tr.dev.stale { opacity: 0.5; }
+</style>
+</head>
 <body>
-<h1>sensor_n2k — Bus Monitor</h1>
-<p>
-<button onclick="discover()">Discover Devices</button>
-<span id="discover-msg" style="margin-left:1em;color:#666"></span>
-<span style="margin-left:1em;color:#999;font-size:.85em">
+${navHtml('busmon')}
+<div class="wrap">
+<h1>Bus Monitor</h1>
+<p class="sub">Live NMEA 2000 device and PGN visibility.</p>
+
+<div class="card">
+<button class="primary" onclick="discover()">Discover Devices</button>
+<span id="discover-msg" style="margin-left:1em;color:var(--text-dim)"></span>
+<p class="sub" style="margin:0.6em 0 0">
   Also polls automatically every 3 min — use this for an immediate check
   (e.g. right after a device that's already running, like an instrument
   display, doesn't show up on its own).
-</span>
 </p>
-<div class="health" id="health"></div>
+</div>
+
+<div class="card">
+<div class="stat-row" id="health"></div>
 <table id="dev-table"><thead><tr><th>Src</th><th>Name</th><th>Mfg</th><th>PGNs</th><th>Total Frames</th><th>Last Seen</th></tr></thead><tbody></tbody></table>
+</div>
+</div>
 
 <script>
+/* A device that hasn't said anything in a while almost certainly isn't on
+ * the bus anymore — there's no way to distinguish "gone" from "just quiet"
+ * with only a lastSeen timestamp. Some devices (e.g. instrument displays
+ * like a Garmin GMI20) don't broadcast anything on their own at all —
+ * they only reply to our firmware's periodic discovery request, which
+ * fires every DISCOVER_INTERVAL (n2k.c) = 3 minutes. A threshold shorter
+ * than that cadence false-positives on every such device for the back
+ * half of each cycle — confirmed on hardware: a Garmin that was fully
+ * online spent roughly half of every 3-minute window marked "offline"
+ * with a 90s threshold. Set comfortably past two full cycles (6 min) so
+ * one missed reply (bus noise, a dropped frame) doesn't flip it either —
+ * this is a "probably gone for good" signal, not a liveness ping. The
+ * device list itself never expires entries (a device seen once stays
+ * listed forever, by design — see onPgnEvent()), so this is purely a
+ * display-side signal. */
+const STALE_MS = 360000;
+
 function fmtAge(ts) {
   if (!ts) return '-';
   const s = Math.round((Date.now() - ts) / 1000);
@@ -263,25 +311,40 @@ function escapeHtml(s) {
   }[c]));
 }
 
+/* render() fully rebuilds #dev-table on every call — including from the
+ * WebSocket, which fires on literally every decoded PGN (broadcastSnapshot()
+ * runs on each onPgnEvent(), server-side), so on an active bus this can
+ * happen many times a second. Without tracking expanded state separately,
+ * each rebuild recreates every detail row hidden by default, collapsing
+ * anything the user just opened almost immediately — confirmed on-device:
+ * clicking a device flashed the PGN list open then instantly closed it. */
+const expandedDevices = {};
+
 function render(data) {
   const h = data.busState || {};
   document.getElementById('health').innerHTML = \`
-    <div>CAN state: <b class="\${h.canState > 0 ? 'bad' : ''}">\${h.canState ?? '?'}</b></div>
-    <div>TX errors: <b class="\${h.txErrCnt ? 'bad' : ''}">\${h.txErrCnt ?? '?'}</b></div>
-    <div>RX errors: <b class="\${h.rxErrCnt ? 'bad' : ''}">\${h.rxErrCnt ?? '?'}</b></div>
-    <div>RX frames: \${h.rxFrameCount ?? '?'}</div>
-    <div>Drop count: <b class="\${h.dropCount ? 'bad' : ''}">\${h.dropCount ?? '?'}</b></div>
-    <div>Claimed SA: 0x\${(h.claimedSA ?? 0).toString(16)}</div>
+    <div class="stat">CAN state <b>\${h.canState ?? '?'}</b> <span class="pill \${h.canState > 0 ? 'danger' : 'ok'}">\${h.canState > 0 ? 'error' : 'ok'}</span></div>
+    <div class="stat">TX errors <b>\${h.txErrCnt ?? '?'}</b> \${h.txErrCnt ? '<span class="pill danger">!</span>' : ''}</div>
+    <div class="stat">RX errors <b>\${h.rxErrCnt ?? '?'}</b> \${h.rxErrCnt ? '<span class="pill danger">!</span>' : ''}</div>
+    <div class="stat">RX frames <b>\${h.rxFrameCount ?? '?'}</b></div>
+    <div class="stat">Drop count <b>\${h.dropCount ?? '?'}</b> \${h.dropCount ? '<span class="pill warn">!</span>' : ''}</div>
+    <div class="stat">Claimed SA <b>0x\${(h.claimedSA ?? 0).toString(16)}</b> \${
+      h.saConfirmed == null ? ''
+      : h.saConfirmed ? '<span class="pill ok">confirmed</span>'
+      : '<span class="pill warn" title="No other device on the bus has ACKed this address yet">unconfirmed</span>'
+    }</div>
   \`;
 
   const tbody = document.querySelector('#dev-table tbody');
   tbody.innerHTML = '';
   (data.devices || []).sort((a, b) => a.src - b.src).forEach(d => {
+    const stale = !d.lastSeen || (Date.now() - d.lastSeen) > STALE_MS;
     const tr = document.createElement('tr');
-    tr.className = 'dev';
+    tr.className = 'dev' + (stale ? ' stale' : '');
     tr.innerHTML = \`<td>0x\${d.src.toString(16)} (\${d.src})</td>
       <td>\${escapeHtml(d.name || '-')} <a href="#" class="rename" title="Rename">✎</a></td>
-      <td>\${escapeHtml(d.manufacturer ?? '-')}</td><td>\${d.pgnCount}</td><td>\${d.totalFrames}</td><td>\${fmtAge(d.lastSeen)}</td>\`;
+      <td>\${escapeHtml(d.manufacturer ?? '-')}</td><td>\${d.pgnCount}</td><td>\${d.totalFrames}</td>
+      <td>\${fmtAge(d.lastSeen)} <span class="pill \${stale ? 'danger' : 'ok'}">\${stale ? 'offline' : 'online'}</span></td>\`;
     tr.onclick = () => togglePgns(d.src);
     tr.querySelector('.rename').onclick = (e) => {
       e.stopPropagation();
@@ -292,7 +355,7 @@ function render(data) {
 
     const detailTr = document.createElement('tr');
     detailTr.className = 'pgns pgns-' + d.src;
-    detailTr.style.display = 'none';
+    detailTr.style.display = expandedDevices[d.src] ? 'table-row' : 'none';
     const inner = document.createElement('td');
     inner.colSpan = 6;
     const t = document.createElement('table');
@@ -311,8 +374,13 @@ function render(data) {
 }
 
 function togglePgns(src) {
+  expandedDevices[src] = !expandedDevices[src];
   document.querySelectorAll('.pgns-' + src).forEach(el => {
-    el.style.display = el.style.display === 'none' ? '' : 'none';
+    /* Clearing to '' doesn't work here — the stylesheet's ".pgns {
+     * display: none }" rule (kept as the initial-hide default) still
+     * applies once the inline override is gone, so the row never
+     * actually became visible. Set an explicit value instead. */
+    el.style.display = expandedDevices[src] ? 'table-row' : 'none';
   });
 }
 
@@ -346,9 +414,24 @@ async function discover() {
   setTimeout(() => { msgEl.textContent = ''; }, 8000);
 }
 
-fetch('/api/bus').then(r => r.json()).then(render);
+/* The WS push below only fires render() when NEW data arrives — during a
+ * quiet bus (nothing transmitting, e.g. every other node offline) that
+ * means "Last Seen" and the online/offline pill silently freeze at
+ * whatever they were on the last real update, even though real time keeps
+ * passing. Re-rendering the last-known data on a plain tick (no new
+ * fetch, no server load) keeps both current against the wall clock. */
+let lastData = null;
+
+function renderAndCache(data) {
+  lastData = data;
+  render(data);
+}
+
+fetch('/api/bus').then(r => r.json()).then(renderAndCache);
 const ws = new WebSocket('ws://' + location.hostname + ':3003');
-ws.onmessage = (ev) => render(JSON.parse(ev.data));
+ws.onmessage = (ev) => renderAndCache(JSON.parse(ev.data));
+
+setInterval(() => { if (lastData) render(lastData); }, 5000);
 </script>
 </body></html>`;
 

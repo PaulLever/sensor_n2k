@@ -38,6 +38,7 @@
 
 const spiLib  = require('spi-device');
 const { FromPgn } = require('@canboat/canboatjs');
+const n2kMapper = require('@signalk/n2k-signalk');
 const WebSocket   = require('ws');
 const http        = require('http');
 const fs          = require('fs');
@@ -93,6 +94,7 @@ const BACKSTOP_MS_NORMAL   = 250;
 const RDY_CHIP = 'gpiochip1';
 const RDY_LINE = '70';
 const MAX_DRAIN_ITERS = 20;   /* cap per trigger burst: 20 x 15 = 300 frames */
+const SPI_DRAIN_PACING_MS = 150; /* see drainLoop() — Zephyr's SPI slave needs this long to re-arm between transfers */
 
 /* ------------------------------------------------------------------ */
 /* Sensor config — load from /etc/sensor_n2k/config.json at startup    */
@@ -122,6 +124,10 @@ const P = {
   ALARM_BUZZER: 0x40, ALARM_LED: 0x41, ALARM_STOP: 0x42,
   DISCOVER_DEVICES: 0x43,
   REQUEST_PRODUCT_INFO: 0x44,
+  OW0_ROM: 0x45, OW1_ROM: 0x46, OW2_ROM: 0x47, OW3_ROM: 0x48,
+  OW_RESCAN: 0x49,
+  BILGE0_ENABLED: 0x4A, BILGE1_ENABLED: 0x4B, BILGE2_ENABLED: 0x4C, BILGE3_ENABLED: 0x4D,
+  BILGE_SWITCH_INSTANCE: 0x4E, BILGE_DEBOUNCE_MS: 0x4F,
   SAVE_NVS:   0xFF,
 };
 
@@ -131,11 +137,17 @@ const PGNCFG = { TEMP: 0, TEMP_EXT: 1, ENV_PARAMS: 2, ENGINE_DYN: 3, TRANS_DYN: 
 const DEFAULT_CFG = {
   onewire: {
     poll_ms: 2000,
+    /* rom_id: hex string (16 chars, matching the hex the ROM-report path
+     * above already produces) identifying the bound DS18B20 by its 1-Wire
+     * ROM, or null for legacy positional binding (slot N = the Nth sensor
+     * found in bus-scan order — the original behavior, kept as a fallback
+     * for slots nobody has explicitly bound yet). See resolve_slave_index()
+     * in onewire.c for how the firmware uses this. */
     slots: [
-      { enabled: true,  pgn_id: PGNCFG.TEMP, source: 2, instance: 1, test_mode: false, test_value_c: 20.0 },
-      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 2, test_mode: false, test_value_c: 20.0 },
-      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 3, test_mode: false, test_value_c: 20.0 },
-      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 4, test_mode: false, test_value_c: 20.0 },
+      { enabled: true,  pgn_id: PGNCFG.TEMP, source: 2, instance: 1, test_mode: false, test_value_c: 20.0, rom_id: null },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 2, test_mode: false, test_value_c: 20.0, rom_id: null },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 3, test_mode: false, test_value_c: 20.0, rom_id: null },
+      { enabled: false, pgn_id: PGNCFG.TEMP, source: 2, instance: 4, test_mode: false, test_value_c: 20.0, rom_id: null },
     ],
   },
   adc:     { enabled: true, pgn_id: PGNCFG.TEMP_EXT, source: 14, instance: 0, poll_ms: 1000, test_mode: false, test_value_c: 20.0 },
@@ -143,6 +155,14 @@ const DEFAULT_CFG = {
     { enabled: false, mode: 'STW', hz_per_mps: 9.33,  update_ms: 1000, avg_samples: 5 },
     { enabled: false, mode: 'RPM', pulses_per_rev: 1.0, engine_instance: 0, update_ms: 500, avg_samples: 3 },
   ],
+  /* Bilge pump monitor — firmware just reports state/cycles/on-time per
+   * channel (see bilge.c); count/runtime alarm thresholds are configured
+   * separately, in alarm-server.js's rules, not here. */
+  bilge: {
+    enabled: [false, false, false, false],
+    switch_instance: 1,
+    debounce_ms: 2000,
+  },
 };
 
 function loadSensorConfig() {
@@ -154,9 +174,57 @@ function loadSensorConfig() {
   return JSON.parse(JSON.stringify(DEFAULT_CFG));
 }
 
+/*
+ * Engine/transmission fault notifications (PGN 127489/127493's
+ * discreteStatus bit fields, mapped by @signalk/n2k-signalk to
+ * notifications.propulsion.<id>.<flag> / .transmission.<flag>) are always
+ * present in every delta once those PGNs are received, because this
+ * device's firmware — having no actual fault sensors for e.g. oil
+ * pressure, coolant level, water flow, etc. — always reports those bits
+ * as "no fault" (see n2k.c's N2K_PGNCFG_ENGINE_DYN/TRANS_DYN: BITLOOKUP
+ * fields have no "not available" bit pattern, so 0 is both "no fault" and
+ * "never checked"). n2k-signalk itself has no third state for this either
+ * — it's alarm-if-set, normal-otherwise, unconditionally. Left unfiltered
+ * that's 24+5 "X is Normal" notifications per engine/transmission instance
+ * for conditions this device was never wired to actually observe.
+ *
+ * notificationPassthrough.propulsion in config.json is an allow-list of
+ * flag keys (e.g. "checkEngine", "transmission.overTemperature" — the
+ * portion of the path after notifications.propulsion.<id>.) to let
+ * through anyway. Empty by default. As real sensors for a given condition
+ * get added (a real oil-pressure switch wired to a bilge/pulse channel,
+ * say), add its flag key here via the Configuration page and its
+ * notification starts flowing — no code change needed.
+ */
+const NOTIFICATION_PATH_RE = /^notifications\.propulsion\.[^.]+\.(.+)$/;
+let notificationAllowList = new Set();
+
+function refreshNotificationAllowList() {
+  const cfg = loadSensorConfig();
+  const list = (cfg.notificationPassthrough && Array.isArray(cfg.notificationPassthrough.propulsion))
+    ? cfg.notificationPassthrough.propulsion
+    : [];
+  notificationAllowList = new Set(list);
+}
+
+function isBlockedNotification(path) {
+  const m = NOTIFICATION_PATH_RE.exec(path);
+  if (!m) return false;   /* not one of these propulsion fault notifications — never filtered */
+  return !notificationAllowList.has(m[1]);
+}
+
 function u16LE(v) { return [v & 0xFF, (v >> 8) & 0xFF]; }
 function floatLE(v) { const b = Buffer.allocUnsafe(4); b.writeFloatLE(v); return [...b]; }
 function pad8(arr) { while (arr.length < 8) arr.push(0); return arr.slice(0, 8); }
+
+/* 16-hex-char ROM id -> 8 big-endian bytes (matches bytes_to_u64_be() in
+ * sensor_config.c and the hex string ONEWIRE_ROM_REPORT_CAN_ID reports
+ * already use). null/unset -> all-zero, which the firmware reads as
+ * "unbound" (falls back to positional binding). */
+function romBE(hex) {
+  if (!hex) return [0, 0, 0, 0, 0, 0, 0, 0];
+  return [...Buffer.from(hex, 'hex')];
+}
 
 function cfgFrame(paramId, data) {
   return { id: (CFG_CAN_ID_BASE | (paramId & 0xFF)) >>> 0, data: Buffer.from(pad8(data)) };
@@ -169,20 +237,21 @@ function enqueueSensorConfig(cfg) {
   /* 1-Wire: shared poll interval + per-slot params */
   q.push(cfgFrame(P.OW_POLL_MS, u16LE(ow.poll_ms)));
   const owSlotParams = [
-    [P.OW0_ENABLED, P.OW0_SOURCE, P.OW0_INSTANCE, P.OW0_PGN, P.OW0_TEST_EN, P.OW0_TEST_VAL],
-    [P.OW1_ENABLED, P.OW1_SOURCE, P.OW1_INSTANCE, P.OW1_PGN, P.OW1_TEST_EN, P.OW1_TEST_VAL],
-    [P.OW2_ENABLED, P.OW2_SOURCE, P.OW2_INSTANCE, P.OW2_PGN, P.OW2_TEST_EN, P.OW2_TEST_VAL],
-    [P.OW3_ENABLED, P.OW3_SOURCE, P.OW3_INSTANCE, P.OW3_PGN, P.OW3_TEST_EN, P.OW3_TEST_VAL],
+    [P.OW0_ENABLED, P.OW0_SOURCE, P.OW0_INSTANCE, P.OW0_PGN, P.OW0_TEST_EN, P.OW0_TEST_VAL, P.OW0_ROM],
+    [P.OW1_ENABLED, P.OW1_SOURCE, P.OW1_INSTANCE, P.OW1_PGN, P.OW1_TEST_EN, P.OW1_TEST_VAL, P.OW1_ROM],
+    [P.OW2_ENABLED, P.OW2_SOURCE, P.OW2_INSTANCE, P.OW2_PGN, P.OW2_TEST_EN, P.OW2_TEST_VAL, P.OW2_ROM],
+    [P.OW3_ENABLED, P.OW3_SOURCE, P.OW3_INSTANCE, P.OW3_PGN, P.OW3_TEST_EN, P.OW3_TEST_VAL, P.OW3_ROM],
   ];
   (ow.slots || []).forEach((slot, i) => {
     if (i >= 4) { return; }
-    const [ep, sp, ip, pp, tep, tvp] = owSlotParams[i];
+    const [ep, sp, ip, pp, tep, tvp, rp] = owSlotParams[i];
     q.push(cfgFrame(ep,  [slot.enabled ? 1 : 0]));
     q.push(cfgFrame(sp,  [slot.source]));
     q.push(cfgFrame(ip,  [slot.instance]));
     q.push(cfgFrame(pp,  [slot.pgn_id !== undefined ? slot.pgn_id : PGNCFG.TEMP]));
     q.push(cfgFrame(tep, [slot.test_mode ? 1 : 0]));
     q.push(cfgFrame(tvp, floatLE(slot.test_value_c !== undefined ? slot.test_value_c : 20.0)));
+    q.push(cfgFrame(rp,  romBE(slot.rom_id)));
   });
 
   const ad = cfg.adc;
@@ -211,6 +280,14 @@ function enqueueSensorConfig(cfg) {
   q.push(cfgFrame(P.PC1_ENG,     [p1.engine_instance || 0]));
   q.push(cfgFrame(P.PC1_UPD,     u16LE(p1.update_ms)));
   q.push(cfgFrame(P.PC1_AVG,     [p1.avg_samples]));
+
+  const bilge = cfg.bilge || DEFAULT_CFG.bilge;
+  const bilgeEnabledParams = [P.BILGE0_ENABLED, P.BILGE1_ENABLED, P.BILGE2_ENABLED, P.BILGE3_ENABLED];
+  bilgeEnabledParams.forEach((p, i) => {
+    q.push(cfgFrame(p, [(bilge.enabled && bilge.enabled[i]) ? 1 : 0]));
+  });
+  q.push(cfgFrame(P.BILGE_SWITCH_INSTANCE, [bilge.switch_instance !== undefined ? bilge.switch_instance : 1]));
+  q.push(cfgFrame(P.BILGE_DEBOUNCE_MS, u16LE(bilge.debounce_ms !== undefined ? bilge.debounce_ms : 2000)));
 
   q.push(cfgFrame(P.SAVE_NVS, []));   /* trigger STM32 NVS persist */
   console.log(`[CFG] Queued ${q.length} config frames for STM32`);
@@ -423,15 +500,57 @@ function handleLocalBusCommand(msg) {
     case 'stop':
       txQueue.push(cfgFrame(P.ALARM_STOP, []));
       break;
-    case 'discover':
+    case 'discover': {
       /* On-demand device discovery — broadcasts an ISO Request for PGN
        * 60928, prompting even passive devices (e.g. instrument displays
        * that only transmit at their own power-on) to respond. See
-       * n2k_discover_devices() in n2k.c. Follow up with a Product Info
-       * request a couple seconds later so devices that implement PGN
-       * 126996 also report their real name — see n2k_request_product_info(). */
-      txQueue.push(cfgFrame(P.DISCOVER_DEVICES, []));
-      setTimeout(() => txQueue.push(cfgFrame(P.REQUEST_PRODUCT_INFO, [])), 2000);
+       * n2k_discover_devices() in n2k.c. Follow up with Product Info
+       * requests so devices that implement PGN 126996 also report their
+       * real name — see n2k_request_product_info().
+       *
+       * Both requests go out as a single GLOBAL broadcast (dst=0xFF), so
+       * on a bus with many devices they can all try to answer in the same
+       * short window. PGN 126996 in particular is fast-packet (4-5 CAN
+       * frames per device), and CAN's arbitration means the frames
+       * themselves never collide on the wire — but a burst of ~10 devices
+       * × ~5 frames each can exceed the SPI bridge's own instantaneous
+       * throughput (see n2k_bench.py's documented loss wall), so WE drop
+       * frames on the way in. A half-received fast-packet sequence never
+       * completes (see fpAssembly's cleanup comment below), so that
+       * device's Product Info response is silently lost for this attempt
+       * — it falls back to manufacturer-only naming even though it does
+       * support 126996. Confirmed on a real ~10-device bus: only devices
+       * that "won" the race got a name; the rest didn't, and one manual
+       * click gives every device exactly one chance to win it.
+       *
+       * Mitigation: repeat both broadcasts several times, spaced out, so
+       * each attempt sees a different arrival-time pattern — a device
+       * that lost the race on attempt 1 has 3 more independent chances.
+       * Harmless to repeat: a device that already answered just resends
+       * the same data, overwriting its own (identical) prior entry. This
+       * doesn't help a device that genuinely doesn't implement PGN 126996
+       * at all — no amount of retrying fixes that, it's a real limitation
+       * of that specific device, not a bug here. */
+      const DISCOVER_ATTEMPTS = 4;
+      const ATTEMPT_SPACING_MS = 400;
+      for (let i = 0; i < DISCOVER_ATTEMPTS; i++) {
+        setTimeout(() => txQueue.push(cfgFrame(P.DISCOVER_DEVICES, [])), i * ATTEMPT_SPACING_MS);
+      }
+      const productInfoStart = (DISCOVER_ATTEMPTS - 1) * ATTEMPT_SPACING_MS + 1500;
+      for (let i = 0; i < DISCOVER_ATTEMPTS; i++) {
+        setTimeout(() => txQueue.push(cfgFrame(P.REQUEST_PRODUCT_INFO, [])), productInfoStart + i * ATTEMPT_SPACING_MS);
+      }
+      break;
+    }
+    case 'ow_rescan':
+      /* Re-run the 1-Wire ROM search on the STM32 (see
+       * onewire_request_rescan() in onewire.c). Results come back
+       * asynchronously as an 'onewireRoms' broadcast once the scan
+       * completes — see handleDiagFrame()'s ONEWIRE_ROM_REPORT_CAN_ID
+       * handling above. Used by config-server.js's sensor-binding UI so
+       * the user can see what's actually on the bus right now (e.g. to
+       * identify a newly-swapped-in replacement sensor's ROM). */
+      txQueue.push(cfgFrame(P.OW_RESCAN, []));
       break;
     default:
       console.warn('[LocalBus] unknown command type:', msg.type);
@@ -527,28 +646,15 @@ function canIdToPgn(canId) {
     : (dp << 16) | (pf << 8);
 }
 
-/* ── Engine instance: canboatjs translates 0→"Single Engine or Dual Engine Port",
- *    1→"Dual Engine Starboard" via its ENGINE_INSTANCE lookup. Return numeric index. ── */
-function engineInstNum(fields) {
-  const raw = fields.engineInstance ?? fields['Engine Instance'] ?? fields.instance;
-  if (raw == null) return 0;
-  if (typeof raw === 'number') return raw;
-  if (typeof raw === 'string') {
-    if (raw.toLowerCase().includes('starboard')) return 1;
-    if (raw.toLowerCase().includes('center') || raw.toLowerCase().includes('centre')) return 2;
-    return 0;  /* Single engine, port, or unknown label */
-  }
-  return 0;
-}
-
-/* ── Temperature source → Signal K path helper ── */
-function tempSourcePath(source, instance) {
-  if      (source === 14 || source === 'Exhaust Gas Temperature')  return `propulsion.${instance}.exhaustTemperature`;
-  else if (source === 2  || source === 'Inside Temperature')        return 'environment.inside.temperature';
-  else if (source === 3  || source === 'Engine Room Temperature')   return 'environment.engineRoom.temperature';
-  else if (source === 1  || source === 'Outside Temperature')       return 'environment.outside.temperature';
-  else                                                               return `environment.temperature.instance${source}`;
-}
+/* engineInstNum()/tempSourcePath() (hand-rolled instance-numbering and
+ * temperature-category path helpers) removed — handleParsedPgn() now
+ * uses @signalk/n2k-signalk's toDelta(), which does the same job more
+ * completely (skEngineId(), temperatureMappings.js) and, importantly,
+ * follows real Signal K schema conventions ours didn't quite match (e.g.
+ * environment.inside.<index>.temperature, the zoneObject pattern —
+ * ours produced environment.inside.temperature.instanceN, a path no
+ * standard Signal K client would recognize). See the comment above the
+ * toDelta() call below. */
 
 /*
  * decoder.on('pgn', handleParsedPgn) is a persistent, module-level
@@ -572,6 +678,105 @@ let _lastFrameSrc = 0;
  * until then (harmless during the brief startup window). */
 let _localBusBroadcast = () => {};
 
+/* ------------------------------------------------------------------ */
+/* Alert catalog — real (alertSystem, alertSubSystem, alertId) values  */
+/* as actually seen on the bus, paired with whatever text PGN 126985   */
+/* carries for that alertId. These are manufacturer-assigned raw       */
+/* numbers with no public lookup table — confirmed by checking          */
+/* @signalk/n2k-signalk's own 126983.js/126985.js handlers, which use   */
+/* them as raw numbers too, no enum resolution. Rather than needing the */
+/* paid NMEA appendix, this builds a real, ground-truth catalog from    */
+/* actual usage over time, which the Alarm page's dropdowns can be      */
+/* populated from later (see alarm-server.js's GET /api/alert-catalog). */
+/* ------------------------------------------------------------------ */
+const ALERT_CATALOG_FILE = '/etc/sensor_n2k/alert-catalog.json';
+
+let alertCatalog = {};
+try {
+  alertCatalog = JSON.parse(fs.readFileSync(ALERT_CATALOG_FILE, 'utf8'));
+} catch (e) {
+  if (e.code !== 'ENOENT') console.warn('[ALERT] failed to read', ALERT_CATALOG_FILE, '—', e.message);
+}
+
+let alertCatalogSaveTimer = null;
+function saveAlertCatalog() {
+  clearTimeout(alertCatalogSaveTimer);
+  alertCatalogSaveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(path.dirname(ALERT_CATALOG_FILE), { recursive: true });
+      fs.writeFileSync(ALERT_CATALOG_FILE, JSON.stringify(alertCatalog, null, 2));
+    } catch (e) {
+      console.warn('[ALERT] failed to save', ALERT_CATALOG_FILE, '—', e.message);
+    }
+  }, 1000);
+}
+
+/* PGN 126985 (Alert Text) and 126983 (the alert itself — system/
+ * subSystem/id, but no text) can arrive in either order or independently
+ * — whichever shows up first for a given alertId is cached here so the
+ * catalog entry gets completed once both have been seen at least once. */
+const pendingAlertText = new Map();
+
+function logAlertPgn(parsed) {
+  const pgn = parsed.pgn;
+  const fields = parsed.fields || {};
+
+  if (pgn === 126985) {
+    const alertId = fields.alertId;
+    if (alertId == null) return;
+    pendingAlertText.set(alertId, {
+      textDescription: fields.alertTextDescription || '',
+      locationTextDescription: fields.alertLocationTextDescription || '',
+    });
+    return;
+  }
+
+  if (pgn !== 126983) return;
+  const { alertType, alertCategory, alertSystem, alertSubSystem, alertId } = fields;
+  if (alertSystem == null || alertId == null) return;
+
+  const key = `${alertSystem}:${alertSubSystem ?? '?'}:${alertId}`;
+  const text = pendingAlertText.get(alertId);
+  const now = new Date().toISOString();
+  /* prev is read-only from here on — entry is always a fresh object, not
+   * prev mutated in place. `const entry = prev || {...}` would alias the
+   * SAME object when prev exists, making prev.x !== entry.x compare a
+   * property against itself post-mutation (always false) — confirmed
+   * with a standalone repro before writing it this way; that bug would
+   * have silently stopped persisting any update to an already-seen
+   * alert (e.g. text arriving after the alert's first sighting). */
+  const prev = alertCatalog[key];
+  const entry = {
+    alertSystem, alertSubSystem: alertSubSystem ?? null, alertId,
+    alertType: alertType ?? (prev ? prev.alertType : null),
+    alertCategory: alertCategory ?? (prev ? prev.alertCategory : null),
+    textDescription: (text && text.textDescription) || (prev ? prev.textDescription : null),
+    locationTextDescription: (text && text.locationTextDescription) || (prev ? prev.locationTextDescription : null),
+    firstSeen: prev ? prev.firstSeen : now,
+    lastSeen: now,
+    count: (prev ? prev.count : 0) + 1,
+  };
+
+  /* Only save when something identity-relevant changed (new entry, or
+   * text/type/category learned) — not on every single re-occurrence.
+   * `count`/`lastSeen` update in memory regardless, so a live query
+   * always has the true count, but the on-disk copy can lag behind it
+   * slightly between saves; that's fine, count is a "how often" bonus
+   * stat, not the point of this catalog (the identity→text mapping is,
+   * and that's always persisted the moment it's learned). Deliberately
+   * avoids a flash write on every occurrence of a frequently-repeating
+   * alert. */
+  const changed = !prev
+    || prev.textDescription !== entry.textDescription
+    || prev.alertType !== entry.alertType
+    || prev.alertCategory !== entry.alertCategory;
+  alertCatalog[key] = entry;
+  if (changed) {
+    console.log('[ALERT]', prev ? 'updated' : 'new', 'catalog entry:', key, entry.textDescription || '(no text yet)');
+    saveAlertCatalog();
+  }
+}
+
 /* Central handler for all decoded PGN events — called from both the main
  * canboatjs decoder (single-frame PGNs) and the fast-packet dispatcher. */
 function handleParsedPgn(parsed) {
@@ -580,69 +785,49 @@ function handleParsedPgn(parsed) {
   const fields = parsed.fields || {};
   const ts     = new Date().toISOString();
   const src    = (parsed.src !== undefined) ? parsed.src : _lastFrameSrc;
-  const values = [];
 
-  /* Broadcast every decoded PGN on the local bus — not just the small
-   * curated subset mapped to Signal K paths below. alarm-server.js and
-   * bus-monitor-server.js both need the full stream. */
+  /* Broadcast every decoded PGN on the local bus — not just the curated
+   * subset mapped to Signal K paths below (still not exhaustive; see that
+   * section's own comment). alarm-server.js and bus-monitor-server.js
+   * both need the full stream regardless. */
   _localBusBroadcast({ type: 'pgn', ts, src, pgn, fields });
 
-  if (pgn === 130316 || pgn === 130312) {
-    const source   = fields.source   ?? fields.temperatureSource;
-    const instance = fields.instance ?? fields.temperatureInstance ?? 0;
-    const tempK    = fields.actualTemperature ?? fields.temperature;
-    if (tempK == null) return;
-    const path = tempSourcePath(source, instance);
-    values.push({ path, value: tempK });
-    console.log(`[N2K] PGN ${pgn} (${source}): ${(tempK - 273.15).toFixed(2)} °C → ${path}`);
+  if (pgn === 126983 || pgn === 126985) {
+    logAlertPgn(parsed);
   }
 
-  if (pgn === 130311) {
-    const source = fields.temperatureSource ?? fields.source ?? 0;
-    const tempK  = fields.temperature;
-    if (tempK == null) return;
-    const path = tempSourcePath(source, 0);
-    values.push({ path, value: tempK });
-    if (fields.humidity != null)          values.push({ path: 'environment.outside.humidity', value: fields.humidity });
-    if (fields.atmosphericPressure != null) values.push({ path: 'environment.outside.pressure', value: fields.atmosphericPressure });
-    console.log(`[N2K] PGN 130311 (${source}): ${(tempK - 273.15).toFixed(2)} °C → ${path}`);
+  /* PGN → Signal K conversion via @signalk/n2k-signalk's real N2kMapper
+   * (the same one signalk-server itself uses), not hand-rolled per-PGN
+   * logic — verified directly against the installed package: toDelta()
+   * takes exactly the {prio, pgn, dst, src, timestamp, fields,
+   * description} shape FromPgn emits (confirmed with a real parse, not
+   * just reading its README), and its coverage (240 PGN handler files)
+   * is both far broader and more standards-correct than what this file
+   * used to hand-roll — e.g. its temperature-category paths follow the
+   * real Signal K zoneObject schema (environment.inside.<index>.
+   * temperature) where ours invented a non-standard convention
+   * (environment.inside.temperature.instanceN). Requires
+   * @signalk/signalk-schema installed alongside it — not in n2k-signalk's
+   * own declared dependencies but required transitively by its AIS
+   * ship-type module, which the whole PGN index eagerly loads even for
+   * PGNs that aren't AIS. */
+  let delta;
+  try {
+    delta = n2kMapper.toDelta({ ...parsed, src });
+  } catch (e) {
+    console.error('[N2K] n2kMapper.toDelta() error for PGN', pgn, ':', e.message);
+    return;
   }
+  if (!delta || !delta.updates || delta.updates.length === 0) return;
 
-  if (pgn === 127489) {
-    const inst = engineInstNum(fields);
-    const oil  = fields.oilTemperature ?? fields['Oil Temperature'];
-    if (oil != null) values.push({ path: `propulsion.${inst}.oilTemperature`, value: oil });
-    const coolant = fields.temperature ?? fields['Engine Temperature'];
-    if (coolant != null) {
-      values.push({ path: `propulsion.${inst}.coolantTemperature`, value: coolant });
-      console.log(`[N2K] PGN 127489 inst=${inst} coolant ${(coolant - 273.15).toFixed(2)} °C`);
-    }
-  }
+  /* Drop propulsion fault notifications this device can't actually vouch
+   * for — see isBlockedNotification()'s comment above loadSensorConfig(). */
+  delta.updates = delta.updates
+    .map(u => ({ ...u, values: (u.values || []).filter(v => !isBlockedNotification(v.path)) }))
+    .filter(u => u.values.length > 0);
+  if (delta.updates.length === 0) return;
 
-  if (pgn === 127493) {
-    const inst    = engineInstNum(fields);
-    const oilTemp = fields.oilTemperature ?? fields['Oil Temperature'];
-    if (oilTemp != null) {
-      values.push({ path: `propulsion.${inst}.transmission.oilTemperature`, value: oilTemp });
-      console.log(`[N2K] PGN 127493 inst=${inst}: ${(oilTemp - 273.15).toFixed(2)} °C`);
-    }
-  }
-
-  if (pgn === 128259) {
-    const stw = fields.speedWaterReferenced ?? fields['Speed Water Referenced'];
-    if (stw != null) values.push({ path: 'navigation.speedThroughWater', value: stw });
-  }
-
-  if (pgn === 127488 && fields.engineSpeed != null) {
-    const inst = fields.engineInstance ?? 0;
-    values.push({ path: `propulsion.${inst}.revolutions`, value: fields.engineSpeed / 60 });
-  }
-
-  if (values.length === 0) return;
-  sendDelta({
-    context: 'vessels.self',
-    updates: [{ source: { label: 'n2k-bridge', type: 'NMEA2000' }, timestamp: ts, values }],
-  });
+  sendDelta({ context: 'vessels.self', ...delta });
 }
 
 decoder.on('pgn', handleParsedPgn);
@@ -674,13 +859,31 @@ const FAST_PACKET_PGNS = new Set([
 
 const fpAssembly = new Map();  /* key: `${src}_${pgn}_${seq}` */
 
+/* A continuation frame that never arrives (SPI bridge / RX overrun during
+ * a burst of near-simultaneous responses — see the 'discover' case in
+ * dispatchLocalMsg() for when this is most likely) leaves its entry here
+ * forever otherwise: nothing ever deletes it, since deletion only happens
+ * on successful completion above. Sweep out anything that's sat
+ * incomplete for more than a couple seconds — real fast-packet sequences
+ * complete in tens of milliseconds, so this only ever catches genuinely
+ * abandoned ones, never a slow-but-still-arriving one. */
+const FP_ASSEMBLY_MAX_AGE_MS = 2000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of fpAssembly) {
+    if (now - entry.startedAt > FP_ASSEMBLY_MAX_AGE_MS) {
+      fpAssembly.delete(key);
+    }
+  }
+}, FP_ASSEMBLY_MAX_AGE_MS).unref();
+
 function handleFpFrame(key, frame, pgn, src, prio) {
   const d  = frame.data;
   const fn = d[0] & 0x1F;
 
   if (fn === 0) {
     /* Start a new assembly, replacing any stale entry with the same key */
-    fpAssembly.set(key, { prio, frames: [frame], total: d[1] });
+    fpAssembly.set(key, { prio, frames: [frame], total: d[1], startedAt: Date.now() });
   } else {
     const entry = fpAssembly.get(key);
     if (!entry) { return; }   /* continuation without a known fn=0 → discard */
@@ -722,19 +925,47 @@ function dispatchFastPacket(pgn, src, prio, frames) {
 const DIAG_CAN_ID      = 0x1EFFFEF;
 const DIAG2_CAN_ID     = 0x1EFFFEE;
 const ALARM_BTN_CAN_ID = 0x1EFFFED;
+const ONEWIRE_ROM_REPORT_CAN_ID = 0x1EFFFEC;
+const ONEWIRE_TEMP_SENTINEL     = 0xFE;
+
+/* Collects a 1-Wire ROM-search report: a marker frame (data[0]=0xFF,
+ * data[1]=count) followed by, for each of the `count` sensors found, TWO
+ * frames back to back — an 8-byte big-endian ROM ID frame (data[0] is the
+ * DS18B20 family code, 0x28) then a TEMP frame (data[0]=0xFE, data[1]=
+ * valid flag, data[2..3]=signed 16-bit LE centi-degrees C) carrying a
+ * live reading taken during that same scan — see ONEWIRE_ROM_REPORT_CAN_ID
+ * in onewire.c for the firmware side of this. A fresh marker always
+ * restarts collection (rather than requiring the previous report to have
+ * completed cleanly), so a frame dropped mid-burst on the Zephyr side
+ * (spi_bridge_enqueue() can silently drop under load — see
+ * spi_bridge_drop_count()) just means this report is discarded, not a
+ * permanently wedged collector. */
+let _owReport = { expecting: 0, roms: [], pendingRom: null };
+
+/* Bilge pump monitor report — see BILGE_REPORT_CAN_ID in bilge.c for the
+ * wire format (4 frames per channel: state, last-1h, last-24h, last-7d). */
+const BILGE_REPORT_CAN_ID = 0x1EFFFEB;
+const BILGE_REC_STATE = 0xB0;
+const BILGE_REC_1H    = 0xB1;
+const BILGE_REC_24H   = 0xB2;
+const BILGE_REC_7D    = 0xB3;
+let _bilgeStats = [0, 1, 2, 3].map(() => ({
+  state: 0, cycles_1h: 0, on_s_1h: 0, cycles_24h: 0, on_s_24h: 0, cycles_7d: 0, on_s_7d: 0,
+}));
 
 function handleDiagFrame(frame) {
   const d = frame.data;
 
   if (frame.id === DIAG_CAN_ID) {
-    const canState  = d[1];
+    const canState  = d[1] & 0x7F;             /* low 3 bits actually used */
+    const saConfirmed = !!(d[1] & 0x80);        /* see n2k_sa_confirmed() */
     const claimedSA = d[2];
     const uptimeS   = d[3] | (d[4] << 8);
     const rxFrameCount = d[5] | (d[6] << 8);
     const dropCount = d[7];
 
     _localBusBroadcast({
-      type: 'busstate', canState, claimedSA, uptimeS, rxFrameCount, dropCount,
+      type: 'busstate', canState, claimedSA, saConfirmed, uptimeS, rxFrameCount, dropCount,
     });
     return true;
   }
@@ -749,6 +980,69 @@ function handleDiagFrame(frame) {
   if (frame.id === ALARM_BTN_CAN_ID) {
     console.log('[ALARM] cancel-button event received');
     _localBusBroadcast({ type: 'button' });
+    return true;
+  }
+
+  if (frame.id === ONEWIRE_ROM_REPORT_CAN_ID) {
+    if (d[0] === 0xFF) {
+      _owReport = { expecting: d[1], roms: [], pendingRom: null };
+      if (_owReport.expecting === 0) {
+        _localBusBroadcast({ type: 'onewireRoms', roms: [] });
+      }
+      return true;
+    }
+    if (d[0] === ONEWIRE_TEMP_SENTINEL) {
+      /* Pairs with the ROM frame collected just before it — see the
+       * wire-format comment on _owReport above. A TEMP frame with no
+       * pending ROM (protocol desync from a dropped frame) is discarded;
+       * the next marker frame resets collection cleanly regardless. */
+      if (_owReport.pendingRom !== null) {
+        const valid = d[1] === 1;
+        _owReport.roms.push({
+          rom: _owReport.pendingRom,
+          tempC: valid ? d.readInt16LE(2) / 100 : null,
+          valid,
+        });
+        _owReport.pendingRom = null;
+        _owReport.expecting--;
+        if (_owReport.expecting === 0) {
+          _localBusBroadcast({ type: 'onewireRoms', roms: _owReport.roms });
+        }
+      }
+      return true;
+    }
+    if (_owReport.expecting > 0) {
+      _owReport.pendingRom = Buffer.from(d.slice(0, 8)).toString('hex');
+    }
+    return true;
+  }
+
+  if (frame.id === BILGE_REPORT_CAN_ID) {
+    const chan = d[0];
+    const rec  = d[1];
+    if (chan < _bilgeStats.length) {
+      const st = _bilgeStats[chan];
+      if (rec === BILGE_REC_STATE) {
+        st.state = d[2];
+      } else if (rec === BILGE_REC_1H) {
+        st.cycles_1h = d.readUInt16LE(2);
+        st.on_s_1h   = d.readUInt32LE(4);
+      } else if (rec === BILGE_REC_24H) {
+        st.cycles_24h = d.readUInt16LE(2);
+        st.on_s_24h   = d.readUInt32LE(4);
+      } else if (rec === BILGE_REC_7D) {
+        st.cycles_7d = d.readUInt16LE(2);
+        st.on_s_7d   = d.readUInt32LE(4);
+      }
+      /* No marker/count frame like the 1-Wire ROM report uses — the 4
+       * record types per channel just stream in as bilge.c's report
+       * thread builds them, a few ms apart. Broadcasting after every
+       * single frame (rather than waiting for a "complete" set) means
+       * consumers always see the latest known value per field with no
+       * extra bookkeeping here; the four fields converge to a fresh
+       * snapshot within the same report cycle regardless. */
+      _localBusBroadcast({ type: 'bilge', channels: _bilgeStats });
+    }
     return true;
   }
 
@@ -819,6 +1113,8 @@ async function run() {
   await connectSK();
   setupLocalBus();
 
+  refreshNotificationAllowList();
+
   /* Config is pushed dynamically when the STM32 is detected online
    * (see scheduleConfigPush / parseRxBlock above). No static timers needed. */
 
@@ -830,6 +1126,18 @@ async function run() {
       reloadTimer = setTimeout(() => {
         console.log('[CFG] Config file changed — re-pushing to STM32…');
         enqueueSensorConfig(loadSensorConfig());
+        refreshNotificationAllowList();
+        /* Any config save is a reasonable moment to also refresh the
+         * 1-Wire ROM search: a sensor plugged in after boot only gets
+         * picked up by resolve_slave_index() once do_scan() has run
+         * again (see onewire.c's header comment on binding-by-ROM) —
+         * without this, binding a slot to a just-plugged-in sensor's ROM
+         * only actually starts working after a reboot, because that's
+         * the only other time do_scan() otherwise runs. Piggybacking on
+         * every save (not just the dedicated Rescan button) means the
+         * common "plug in sensor, bind it, Save & Apply" flow just works
+         * without an extra manual step. */
+        txQueue.push(cfgFrame(P.OW_RESCAN, []));
       }, 200);
     });
     console.log('[CFG] Watching', CONFIG_FILE, 'for changes');
@@ -878,11 +1186,55 @@ async function run() {
 
   /* Keep transferring while the last block came back full (probable
    * backlog) or there's outbound data queued, bounded so a runaway
-   * producer can't turn one trigger into an unbounded tight loop. */
+   * producer can't turn one trigger into an unbounded tight loop.
+   *
+   * _drainActive serializes this against itself: drainLoop() is invoked
+   * from multiple independent trigger sources (every gpiomon RDY rising
+   * edge, plus the periodic backstop timer), and RDY fires constantly
+   * during normal telemetry — so without this guard, two invocations
+   * routinely overlap. doTransferOnce()'s _inFlight check stops them from
+   * launching concurrent physical transfers, but each overlapping
+   * invocation still burns through its OWN MAX_DRAIN_ITERS budget on
+   * instant no-op skips (a skipped iteration returns immediately, doesn't
+   * drain anything, and isn't retried by that invocation) — so the loser
+   * can exhaust all 20 iterations without transferring a single real
+   * block, and gives up while txQueue still has a large backlog (e.g. a
+   * multi-block config push). Confirmed via RTT: only ever the *first*
+   * 15-frame block of a 51-frame config push actually reached
+   * sensor_config_update() on the Zephyr side, no matter how many
+   * transfers bridge.js's own bookkeeping believed it completed. With
+   * only one drainLoop "session" running at a time, a concurrent trigger
+   * arriving mid-drain is just a no-op — the active session's own loop
+   * already keeps going until txQueue is empty (or its 20-iteration cap),
+   * so nothing is lost by skipping the redundant call. */
+  let _drainActive = false;
   const drainLoop = async (source) => {
-    for (let i = 0; i < MAX_DRAIN_ITERS; i++) {
-      const full = await doTransferOnce();
-      if (!full && txQueue.length === 0) break;
+    if (_drainActive) return;
+    _drainActive = true;
+    try {
+      for (let i = 0; i < MAX_DRAIN_ITERS; i++) {
+        if (i > 0 && txQueue.length > 0) {
+          /* Confirmed via RTT + SPI-level tracing: back-to-back transfers
+           * with no gap get a *successful* Linux-side ioctl but garbage
+           * RX content (magic=0xFF, count=255 — MISO floating), meaning
+           * Zephyr's bridge_thread hadn't looped back to a re-armed
+           * spi_transceive() yet. Needed *in addition to* the
+           * single-session guard above, not instead of it — the earlier
+           * attempt at pacing alone failed only because a second,
+           * unguarded drainLoop() was sneaking real transfers into the
+           * gap. Scoped to txQueue.length>0 (a real outbound backlog —
+           * the confirmed/reproduced scenario, e.g. a multi-block config
+           * push) rather than every continuation, so a `full` RX-only
+           * streak (heavy incoming bus traffic, nothing queued to send)
+           * isn't throttled to ~1 block/150ms for a problem that was
+           * never demonstrated on that path. */
+          await new Promise((resolve) => setTimeout(resolve, SPI_DRAIN_PACING_MS));
+        }
+        const full = await doTransferOnce();
+        if (!full && txQueue.length === 0) break;
+      }
+    } finally {
+      _drainActive = false;
     }
   };
 

@@ -21,10 +21,13 @@
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+const { SHARED_STYLE, navHtml } = require('./shared-ui');
 
 const bt = require('./bt-speaker.js');
 
@@ -152,6 +155,16 @@ const DEFAULT_ALARMS = {
     output: 'buzzer_simple',   /* buzzer_simple | buzzer_led_button | bt_speaker */
     bt_speaker: { mac: '', name: '' },
   },
+  /* Off-boat push notifications — see notifyRemote() below. Off by
+   * default: this is the one alarm channel that leaves the vessel, and it
+   * should be an explicit choice, not something that starts happening
+   * because the software was updated. */
+  remoteNotify: {
+    enabled: false,
+    channel: 'ntfy',           /* the seam: 'ntfy' today, 'email' later */
+    ntfyServer: 'https://ntfy.sh',
+    topic: '',
+  },
   rules: [],
 };
 
@@ -160,6 +173,10 @@ function loadAlarms() {
     if (fs.existsSync(ALARMS_FILE)) {
       const raw = JSON.parse(fs.readFileSync(ALARMS_FILE, 'utf8'));
       if (!raw.hardware) raw.hardware = JSON.parse(JSON.stringify(DEFAULT_ALARMS.hardware));
+      /* Merged rather than replaced so an alarms.json written before
+       * remote notifications existed picks up the new defaults, and one
+       * written before a later key was added picks up just that key. */
+      raw.remoteNotify = { ...DEFAULT_ALARMS.remoteNotify, ...(raw.remoteNotify || {}) };
       if (!Array.isArray(raw.rules)) raw.rules = [];
       raw.rules.forEach(r => { r.alarm_type = migrateAlarmType(r.alarm_type); });
       return raw;
@@ -202,6 +219,7 @@ function connectLocalBus() {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
     if (msg.type === 'pgn') { evaluateRules(msg); }
+    else if (msg.type === 'bilge') { evaluateRules(msg); }
     else if (msg.type === 'button') { cancelAll(); }
     /* type:'busstate' — not currently consumed here; bus-monitor-server.js owns it. */
   });
@@ -285,6 +303,37 @@ function matchAlertRule(rule, evt) {
   return { outOfRange, value: stateField };
 }
 
+/* Bilge pump count/runtime rules. Unlike the PGN-decoded rules above,
+ * these match against bilge.c's own rolling-window stats (see
+ * BILGE_REPORT_CAN_ID in bridge.js) rather than a real N2K field —
+ * rule.metric picks cycles vs. on-time, rule.period picks which of the
+ * three rolling windows the firmware maintains. There's no separate
+ * "state" concept here the way matchRangeRule's belowMin/aboveMax has —
+ * this fires (and stays fired, same as any other rule) whenever the
+ * chosen window's count/runtime is at or above threshold, and clears
+ * once it rolls back below — e.g. "more than 20 cycles in the last hour"
+ * will clear on its own an hour after the last qualifying cycle, once
+ * that cycle ages out of the rolling window, without needing a manual
+ * cancel. */
+function matchBilgeRule(rule, evt) {
+  if (evt.type !== 'bilge') return null;
+  if (rule.channel == null || rule.channel < 0 || rule.channel > 3) return null;
+
+  const ch = evt.channels[rule.channel];
+  if (!ch) return null;
+
+  const field = {
+    count_1h: 'cycles_1h', count_24h: 'cycles_24h', count_7d: 'cycles_7d',
+    runtime_1h: 'on_s_1h', runtime_24h: 'on_s_24h', runtime_7d: 'on_s_7d',
+  }[`${rule.metric}_${rule.period}`];
+  if (!field) return null;
+
+  const val = ch[field];
+  if (val == null) return null;
+
+  return { outOfRange: rule.threshold != null && val >= rule.threshold, value: val };
+}
+
 /* ------------------------------------------------------------------ */
 /* Active-alarm state machine                                          */
 /* ------------------------------------------------------------------ */
@@ -307,6 +356,62 @@ function syncBtReconnectMonitor() {
   const mac = g_alarms.hardware.bt_speaker && g_alarms.hardware.bt_speaker.mac;
   if (g_alarms.hardware.output === 'bt_speaker' && mac) {
     btReconnectHandle = bt.monitorAndReconnect(mac, 30000);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* IP announcement — via the paired Bluetooth speaker, spoken once at  */
+/* boot (see announceBootWhenReady() below) so the board's address can */
+/* be found after moving to a network where mDNS (.local) resolution   */
+/* isn't reliable (confirmed unreliable over at least one Android      */
+/* hotspot) and the old IP no longer applies — no prior network access */
+/* needed to hear it, just Bluetooth range.                            */
+/* ------------------------------------------------------------------ */
+
+/** First non-internal IPv4 address, preferring wlan0 (this board's normal
+ *  network path) if present. Returns null if nothing's up yet (e.g. still
+ *  associating at boot). */
+function currentIpAddress() {
+  const ifaces = os.networkInterfaces();
+  const order = ifaces.wlan0 ? ['wlan0'] : Object.keys(ifaces);
+  for (const name of order) {
+    const addrs = ifaces[name];
+    if (!addrs) continue;
+    const v4 = addrs.find(a => a.family === 'IPv4' && !a.internal);
+    if (v4) return v4.address;
+  }
+  return null;
+}
+
+/** "192.168.43.2" -> "1 9 2 dot 1 6 8 dot 4 3 dot 2" — spelling out each
+ *  digit individually rather than as multi-digit numbers ("one hundred
+ *  ninety two") is far less ambiguous to write down from hearing once. */
+function speakableIp(ip) {
+  return ip.split('.').map(octet => octet.split('').join(' ')).join(' dot ');
+}
+
+async function announceIpAddress() {
+  const mac = g_alarms.hardware.bt_speaker && g_alarms.hardware.bt_speaker.mac;
+  if (g_alarms.hardware.output !== 'bt_speaker' || !mac) {
+    console.log('[ALARM] announceIpAddress: no Bluetooth speaker configured, skipping');
+    return;
+  }
+  const ip = currentIpAddress();
+  const text = ip
+    ? `Sensor N2K network address: ${speakableIp(ip)}`
+    : 'Sensor N2K has no network address yet';
+  console.log('[ALARM] announcing:', text);
+  try {
+    /* Piper's normal pace (length_scale 1.0) runs digits together enough
+     * to blur on a first listen — confirmed by ear. 1.25 is a modest
+     * slowdown (not the more aggressive rate alarm speech might want),
+     * tuned for "write this IP down as you hear it" rather than routine
+     * alarm announcements, which stay at normal speed. */
+    const IP_LENGTH_SCALE = 1.25;
+    const ok = await bt.announce(text, mac, IP_LENGTH_SCALE);
+    if (!ok) console.error('[ALARM] announceIpAddress: playback failed (no audio reached the device)');
+  } catch (e) {
+    console.error('[ALARM] announceIpAddress error:', e.message);
   }
 }
 
@@ -368,11 +473,130 @@ function notifyWebClients(type, rule) {
   broadcastToWebClients({ type, rule: { id: rule.id, label: rule.label, alarm_type: rule.alarm_type } });
 }
 
+/* ------------------------------------------------------------------ */
+/* Remote notification (off-boat) — ntfy.sh push                        */
+/* ------------------------------------------------------------------ */
+
+/* Every other alarm channel in this file is local: buzzer, LED, BT
+ * speaker, Signal K, web popup. All of them keep working with no
+ * internet, which is a deliberate design property of this project (see
+ * PIPER-NOTES.md — "this is a boat alarm system, not a cloud-TTS
+ * candidate"), not an accident. This channel is the exception: it is the
+ * only one that needs the outside world, so it is built to be the only
+ * one that can fail without anyone noticing.
+ *
+ * Fire-and-forget, hard: short timeout, every error swallowed, nothing
+ * awaited by the caller, and no throw path back into triggerAlarm(). A
+ * dead uplink, a DNS timeout, or a 500 from ntfy.sh must be completely
+ * invisible to the buzzer.
+ *
+ * ntfy.sh needs no signup and no API key: POST the message body to
+ * https://ntfy.sh/<topic>, subscribe to the same topic in the phone app.
+ * The flip side is that the topic string IS the credential — anyone who
+ * guesses it can read the alarms (and send fake ones), so the UI pushes
+ * for a long random topic name.
+ */
+
+const REMOTE_NOTIFY_TIMEOUT_MS = 5000;
+
+/** Build the {title, message, priority, tags} for a rule/state pair, in
+ *  one place, so any future channel (email/SMTP, per the intent to add it
+ *  later) renders the same content rather than inventing its own. */
+function remoteNotifyPayload(rule, state) {
+  const active = state === 'active';
+  return {
+    title: active ? `ALARM: ${rule.label}` : `Cleared: ${rule.label}`,
+    message: active
+      ? `${rule.label} went out of range on ${os.hostname()}.`
+      : `${rule.label} is back to normal on ${os.hostname()}.`,
+    /* ntfy priorities: 1 min .. 5 max. A "bell"/"alarm" rule should
+     * bypass a phone's quiet hours; a routine clear should not. */
+    priority: active ? (rule.alarm_type === 'alarm' || rule.alarm_type === 'bell' ? '5' : '4') : '3',
+    tags: active ? 'warning' : 'white_check_mark',
+  };
+}
+
+/** POST to ntfy. Resolves {ok, error} — never rejects. */
+function sendNtfy(cfg, payload) {
+  return new Promise((resolve) => {
+    let target;
+    try {
+      const base = (cfg.ntfyServer || 'https://ntfy.sh').replace(/\/+$/, '');
+      target = new URL(`${base}/${encodeURIComponent(cfg.topic)}`);
+    } catch (e) {
+      resolve({ ok: false, error: `bad ntfy server URL: ${e.message}` });
+      return;
+    }
+
+    /* Node's built-in http/https — no HTTP client library. This project
+     * has zero of them today and one POST does not justify the first. */
+    const mod = target.protocol === 'http:' ? http : https;
+    const body = Buffer.from(payload.message, 'utf8');
+    const req = mod.request(target, {
+      method: 'POST',
+      timeout: REMOTE_NOTIFY_TIMEOUT_MS,
+      headers: {
+        /* ntfy reads its metadata from headers. They must be
+         * header-safe: a rule label with a newline in it would otherwise
+         * be a header-injection, and a non-ASCII label makes some HTTP
+         * stacks throw on write. */
+        'Title': headerSafe(payload.title),
+        'Priority': payload.priority,
+        'Tags': payload.tags,
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Length': body.length,
+      },
+    }, (res) => {
+      res.resume();   /* drain, or the socket lingers */
+      const ok = res.statusCode >= 200 && res.statusCode < 300;
+      resolve({ ok, error: ok ? null : `ntfy returned HTTP ${res.statusCode}` });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timed out' }); });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.end(body);
+  });
+}
+
+function headerSafe(s) {
+  return String(s).replace(/[\r\n]+/g, ' ').replace(/[^\x20-\x7e]/g, '?').slice(0, 200);
+}
+
+/**
+ * The single fan-out seam for off-boat notifications, called from
+ * triggerAlarm()/clearAlarm() next to publishSkNotification(). Adding
+ * email/SMTP later is a new branch on `channel` plus a sender function —
+ * not a rewrite, and not another call site to remember.
+ *
+ * @param {object} rule
+ * @param {'active'|'normal'} state
+ */
+function notifyRemote(rule, state) {
+  const cfg = g_alarms.remoteNotify || {};
+  if (!cfg.enabled) return;
+  if (!rule.notify_remote) return;   /* per-rule opt-in, mirrors rule.publish_to_signalk */
+  sendRemoteNotification(cfg, remoteNotifyPayload(rule, state))
+    .then(r => {
+      if (!r.ok) console.warn('[ALARM] remote notify failed (local alarms unaffected):', r.error);
+    })
+    .catch(e => console.warn('[ALARM] remote notify error (local alarms unaffected):', e.message));
+}
+
+function sendRemoteNotification(cfg, payload) {
+  switch (cfg.channel || 'ntfy') {
+    case 'ntfy':
+      if (!cfg.topic) return Promise.resolve({ ok: false, error: 'no ntfy topic configured' });
+      return sendNtfy(cfg, payload);
+    default:
+      return Promise.resolve({ ok: false, error: `unknown remote channel "${cfg.channel}"` });
+  }
+}
+
 function triggerAlarm(rule) {
   const entry = { since: Date.now(), lastRepeat: Date.now(), acked: false };
   activeAlarms.set(rule.id, entry);
   driveHardwareOn(rule);
   publishSkNotification(rule, 'active');
+  notifyRemote(rule, 'active');
   notifyWebClients('alarm_triggered', rule);
   console.log(`[ALARM] triggered: ${rule.label} (${rule.id})`);
 }
@@ -381,6 +605,7 @@ function clearAlarm(rule) {
   activeAlarms.delete(rule.id);
   driveHardwareOff();
   publishSkNotification(rule, 'normal');
+  notifyRemote(rule, 'normal');
   notifyWebClients('alarm_cleared', rule);
   console.log(`[ALARM] cleared: ${rule.label} (${rule.id})`);
 }
@@ -411,6 +636,7 @@ function evaluateRules(evt) {
     let result = null;
     if (rule.kind === 'range') result = matchRangeRule(rule, evt);
     else if (rule.kind === 'alert_pgn') result = matchAlertRule(rule, evt);
+    else if (rule.kind === 'bilge') result = matchBilgeRule(rule, evt);
     if (!result) continue;
 
     const active = activeAlarms.get(rule.id);
@@ -569,7 +795,7 @@ function syncDefaultRulesFromConfig() {
     const rule = existing || {
       id, kind: 'range', default: true, enabled: true, ignore: false,
       alarm_type: 'warning', repeat_mode: 'repeat_n', repeat_seconds: 30,
-      publish_to_signalk: false,
+      publish_to_signalk: false, notify_remote: false,
     };
     rule.label = label;
     rule.voice = voice;
@@ -666,6 +892,7 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/alarms') {
     json(res, 200, {
       hardware: g_alarms.hardware,
+      remoteNotify: g_alarms.remoteNotify,
       rules: g_alarms.rules,
       active: Array.from(activeAlarms.entries()).map(([id, e]) => ({ id, ...e })),
     });
@@ -718,6 +945,24 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/alert-catalog') {
+    /* Real (alertSystem, alertSubSystem, alertId) values as actually seen
+     * on the bus, built up by bridge.js from PGN 126983/126985 — see its
+     * own comment for why (no public lookup table for these exists).
+     * Read fresh from disk on each request rather than duplicating
+     * bridge.js's in-memory state here — this is checked occasionally,
+     * not on any hot path, so simplicity wins over plumbing a live feed
+     * through the local bus for it. */
+    let catalog = {};
+    try {
+      catalog = JSON.parse(fs.readFileSync('/etc/sensor_n2k/alert-catalog.json', 'utf8'));
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.error('[ALARM] failed to read alert-catalog.json:', e.message);
+    }
+    json(res, 200, { alerts: Object.values(catalog) });
+    return true;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/devices') {
     json(res, 200, { devices: await fetchBusDevices() });
     return true;
@@ -736,6 +981,46 @@ async function handleApi(req, res, url) {
     return true;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/remote-notify') {
+    json(res, 200, g_alarms.remoteNotify);
+    return true;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/remote-notify') {
+    const body = JSON.parse(await readBody(req));
+    g_alarms.remoteNotify = { ...g_alarms.remoteNotify, ...body };
+    saveAlarms();
+    json(res, 200, { ok: true });
+    return true;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/remote-notify/test') {
+    /* Mirrors /api/bt/test above: exercise the real send path (not a
+     * mocked one) and report the actual failure text, since "nothing
+     * arrived on my phone" has half a dozen causes and only the server
+     * can distinguish "no internet" from "wrong topic". Uses the config
+     * as POSTed if supplied, so the button can be pressed before Save. */
+    let override = {};
+    try { override = JSON.parse(await readBody(req) || '{}'); } catch (e) { /* no body is fine */ }
+    const cfg = { ...g_alarms.remoteNotify, ...override };
+    if (!cfg.topic) {
+      json(res, 400, { ok: false, error: 'Set a topic first.' });
+      return true;
+    }
+    const r = await sendRemoteNotification(cfg, {
+      title: `sensor_n2k test — ${os.hostname()}`,
+      message: 'This is a test notification from your sensor_n2k alarm system. ' +
+        'If you can read this on your phone, remote alarms will reach you.',
+      priority: '3',
+      tags: 'white_check_mark',
+    });
+    json(res, r.ok ? 200 : 502, { ok: r.ok, error: r.ok ? undefined : r.error });
+    return true;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/bt/known') {
+    const devices = await bt.listKnownDevices();
+    json(res, 200, { devices });
+    return true;
+  }
   if (req.method === 'GET' && url.pathname === '/api/bt/scan') {
     const seconds = parseInt(url.searchParams.get('seconds') || '8', 10);
     const devices = await bt.scanDevices(seconds * 1000);
@@ -744,12 +1029,44 @@ async function handleApi(req, res, url) {
   }
   if (req.method === 'POST' && url.pathname === '/api/bt/pair') {
     const body = JSON.parse(await readBody(req));
+    const prevMac = g_alarms.hardware.bt_speaker && g_alarms.hardware.bt_speaker.mac;
+
+    if (prevMac && prevMac !== body.mac) {
+      /* Switching speakers: stop the background reconnect monitor for the
+       * old device first — otherwise it can re-issue `connect <prevMac>`
+       * every 30s while we're mid-connect to the new one, both contending
+       * for the same Bluetooth radio (see monitorAndReconnect()). Then
+       * explicitly disconnect the old device — pairAndConnect() never did
+       * this on its own, so the previously-connected speaker just stayed
+       * connected underneath, and BlueZ was left juggling two devices. */
+      if (btReconnectHandle) { btReconnectHandle.stop(); btReconnectHandle = null; }
+      await bt.disconnect(prevMac);
+    }
+
     const result = await bt.pairAndConnect(body.mac);
+    console.log(`[BT] pair ${body.mac} (${body.name || '?'}) -> connected=${result.connected} paired=${result.paired} trusted=${result.trusted}`);
     if (result.connected) {
       g_alarms.hardware.bt_speaker = { mac: body.mac, name: body.name || '' };
       saveAlarms();
-      syncBtReconnectMonitor();
+    } else if (prevMac && prevMac !== body.mac) {
+      /* Already disconnected the old device to make room for this one —
+       * don't leave hardware.bt_speaker silently pointing at a speaker we
+       * just told to disconnect when the new one failed to come up. */
+      console.log(`[BT] connect to ${body.mac} failed after disconnecting previous device ${prevMac} — clearing configured speaker`);
+      g_alarms.hardware.bt_speaker = null;
+      saveAlarms();
     }
+    syncBtReconnectMonitor();
+    json(res, 200, result);
+    return true;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/bt/disconnect') {
+    const mac = g_alarms.hardware.bt_speaker && g_alarms.hardware.bt_speaker.mac;
+    console.log(`[BT] disconnect requested for ${mac || '(none configured)'}`);
+    if (btReconnectHandle) { btReconnectHandle.stop(); btReconnectHandle = null; }
+    const result = mac ? await bt.disconnect(mac) : { disconnected: true };
+    g_alarms.hardware.bt_speaker = null;
+    saveAlarms();
     json(res, 200, result);
     return true;
   }
@@ -775,24 +1092,16 @@ async function handleApi(req, res, url) {
 }
 
 const WEBAPP_HTML = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>sensor_n2k Alarms</title>
-<style>
-body{font-family:sans-serif;max-width:900px;margin:2em auto;padding:0 1em}
-table{border-collapse:collapse;width:100%;margin-bottom:1em}
-th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}
-th{background:#f0f0f0}
-.tabs button{padding:8px 16px;margin-right:4px;cursor:pointer}
-.tabs button.active{background:#333;color:#fff}
-.tab{display:none}
-.tab.active{display:block}
-#popup{display:none;position:fixed;top:0;left:0;right:0;background:#c00;color:#fff;padding:1em;text-align:center;font-size:18px;z-index:100}
-#popup button{margin-left:1em;padding:6px 14px;font-size:16px}
-input,select{margin:2px;padding:4px}
-fieldset{margin-bottom:1em}
-</style></head>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sensor_n2k Alarms</title>
+${SHARED_STYLE}
+</head>
 <body>
+${navHtml('alarms')}
 <div id="popup"><span id="popup-msg"></span><button onclick="cancelAlarm(currentAlarmId)">Cancel</button></div>
-<h1>sensor_n2k — Alarms</h1>
+<div class="wrap">
+<h1>Alarms</h1>
 <div class="tabs">
 <button class="active" onclick="showTab('rules')">Rules</button>
 <button onclick="showTab('hardware')">Hardware</button>
@@ -800,8 +1109,9 @@ fieldset{margin-bottom:1em}
 </div>
 
 <div id="tab-rules" class="tab active">
-<h2>Rules</h2>
-<table id="rules-table"><thead><tr><th>Label</th><th>Kind</th><th>Enabled</th><th>Type</th><th>Repeat</th><th>SK</th><th></th></tr></thead><tbody></tbody></table>
+<div class="card">
+<h2 style="margin-top:0">Rules</h2>
+<table id="rules-table"><thead><tr><th>Label</th><th>Kind</th><th>Enabled</th><th>Type</th><th>Repeat</th><th>SK</th><th>Push</th><th></th></tr></thead><tbody></tbody></table>
 <button onclick="showAddForm()">+ Add Rule</button>
 <fieldset id="add-form" style="display:none">
 <legend>Rule</legend>
@@ -811,6 +1121,7 @@ fieldset{margin-bottom:1em}
 <select id="f-kind" onchange="toggleKindFields()">
 <option value="range">Range (sensor value)</option>
 <option value="alert_pgn">Alert PGN (126983)</option>
+<option value="bilge">Bilge Pump</option>
 </select></label><br>
 <div id="range-fields">
 <label>PGN
@@ -839,6 +1150,30 @@ fieldset{margin-bottom:1em}
 </label>
 <label><input type="checkbox" id="f-ignore"> Ignore matching alerts from this source</label>
 </div>
+<div id="bilge-fields" style="display:none">
+<label>Channel
+<select id="f-bilge-channel">
+<option value="0">Bilge Pump 1</option>
+<option value="1">Bilge Pump 2</option>
+<option value="2">Bilge Pump 3</option>
+<option value="3">Bilge Pump 4</option>
+</select>
+</label>
+<label>Metric
+<select id="f-bilge-metric" onchange="onBilgeMetricChange()">
+<option value="count">Cycle count</option>
+<option value="runtime">Time running</option>
+</select>
+</label>
+<label>Period
+<select id="f-bilge-period">
+<option value="1h">Last 1 hour</option>
+<option value="24h">Last 24 hours</option>
+<option value="7d">Last 7 days (current week)</option>
+</select>
+</label>
+<label id="f-bilge-threshold-label">Threshold (cycles) <input id="f-bilge-threshold" type="number" step="any"></label>
+</div>
 <br>
 <label>Alarm Type
 <select id="f-alarm_type">
@@ -856,13 +1191,16 @@ fieldset{margin-bottom:1em}
 </label>
 <label id="repeat-seconds-label">Seconds <input id="f-repeat_seconds" type="number" value="30"></label><br>
 <label><input type="checkbox" id="f-publish_to_signalk"> Publish to Signal K notifications</label><br>
+<label><input type="checkbox" id="f-notify_remote"> Send a phone notification (configure under Hardware → Remote notifications)</label><br>
 <label><input type="checkbox" id="f-enabled" checked> Enabled</label><br>
-<button onclick="saveRule()">Save</button> <button onclick="hideAddForm()">Cancel</button>
+<button class="primary" onclick="saveRule()">Save</button> <button onclick="hideAddForm()">Cancel</button>
 </fieldset>
+</div>
 </div>
 
 <div id="tab-hardware" class="tab">
-<h2>Hardware</h2>
+<div class="card">
+<h2 style="margin-top:0">Hardware</h2>
 <label>Output
 <select id="hw-output" onchange="onHwOutputSelect()">
 <option value="buzzer_simple">Buzzer (simple)</option>
@@ -870,20 +1208,48 @@ fieldset{margin-bottom:1em}
 <option value="bt_speaker">Bluetooth Speaker</option>
 </select>
 </label>
-<button onclick="saveHardware()">Save</button>
+<button class="primary" onclick="saveHardware()">Save</button>
 <div id="bt-panel" style="display:none">
 <h3>Bluetooth Speaker</h3>
-<p>Status: <span id="bt-status">unknown</span></p>
-<button onclick="btScan()">Scan</button>
-<ul id="bt-devices"></ul>
+<p>Status: <span id="bt-status" class="pill neutral">unknown</span> <button id="bt-disconnect-btn" onclick="btDisconnect()">Disconnect</button></p>
+<p class="sub" style="margin:0.8em 0 0.2em">Already paired</p>
+<ul id="bt-known" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:0.4em 0.8em;margin:0.2em 0"><li>Loading…</li></ul>
+<p class="sub" style="margin:1em 0 0.2em">New device — hold its pairing button until the light flashes, then scan</p>
+<button id="bt-scan-btn" onclick="btScan()">Scan</button>
+<ul id="bt-devices" style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius);padding:0.4em 0.8em;margin:0.5em 0"></ul>
 <button onclick="btTest()">Play Test Tone + Announcement</button>
-<span id="bt-test-msg" style="margin-left:1em;color:#c00"></span>
+<span id="bt-test-msg" style="margin-left:1em;color:var(--danger)"></span>
+</div>
+</div>
+
+<div class="card">
+<h2 style="margin-top:0">Remote notifications</h2>
+<p class="sub">Push alarms to a phone when you are off the boat, via <a href="https://ntfy.sh" target="_blank" rel="noopener">ntfy.sh</a>
+(free, no account needed — install the ntfy app and subscribe to the same topic).
+Tick <b>Send a phone notification</b> on each rule that should reach you.</p>
+<label><input type="checkbox" id="rn-enabled" onchange="rnDirty=true"> Enabled</label><br>
+<label>Server <input id="rn-server" style="width:16em" oninput="rnDirty=true"></label>
+<label>Topic <input id="rn-topic" style="width:22em" oninput="rnDirty=true" placeholder="e.g. svgeorgia-n2k-7f3a91c2"></label>
+<button onclick="rnRandomTopic()">Generate</button>
+<br>
+<button class="primary" onclick="rnSave()">Save</button>
+<button onclick="rnTest()">Send test notification</button>
+<span id="rn-msg" style="margin-left:1em"></span>
+<p class="sub" style="margin-top:0.8em"><b>Use a long, random topic name.</b> On the public ntfy.sh server the
+topic string is the only thing protecting your alarms — anyone who guesses it can read them, and send fake
+ones. Do not use the boat's name on its own.</p>
+<p class="sub">This channel needs internet. Every local channel — buzzer, LED, Bluetooth speaker, the popup on
+these pages — keeps working exactly as it does now when there is none; a push that cannot be delivered simply
+fails silently.</p>
 </div>
 </div>
 
 <div id="tab-active" class="tab">
-<h2>Active Alarms</h2>
+<div class="card">
+<h2 style="margin-top:0">Active Alarms</h2>
 <table id="active-table"><thead><tr><th>Label</th><th>Since</th><th>Acked</th><th></th></tr></thead><tbody></tbody></table>
+</div>
+</div>
 </div>
 
 <script>
@@ -894,6 +1260,10 @@ let alertTypes = {};
 let alertCategories = {};
 let busDevices = [];
 let hwDirty = false;
+let btKnownLoaded = false;
+/* Same purpose as hwDirty, for the Remote notifications card — the 5s
+ * refresh() would otherwise wipe a half-typed ntfy topic. */
+let rnDirty = false;
 
 function showTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -903,9 +1273,15 @@ function showTab(name) {
 }
 
 function toggleKindFields() {
-  const isRange = document.getElementById('f-kind').value === 'range';
-  document.getElementById('range-fields').style.display = isRange ? '' : 'none';
-  document.getElementById('alert-fields').style.display = isRange ? 'none' : '';
+  const kind = document.getElementById('f-kind').value;
+  document.getElementById('range-fields').style.display = kind === 'range' ? '' : 'none';
+  document.getElementById('alert-fields').style.display = kind === 'alert_pgn' ? '' : 'none';
+  document.getElementById('bilge-fields').style.display = kind === 'bilge' ? '' : 'none';
+}
+function onBilgeMetricChange() {
+  const isCount = document.getElementById('f-bilge-metric').value === 'count';
+  document.getElementById('f-bilge-threshold-label').firstChild.textContent =
+    isCount ? 'Threshold (cycles) ' : 'Threshold (minutes) ';
 }
 function toggleRepeatSeconds() {
   document.getElementById('repeat-seconds-label').style.display =
@@ -1027,11 +1403,17 @@ function resetForm() {
   document.getElementById('f-alertId').value = '';
   document.getElementById('f-alert-src').value = '';
   document.getElementById('f-ignore').checked = false;
+  document.getElementById('f-bilge-channel').value = '0';
+  document.getElementById('f-bilge-metric').value = 'count';
+  onBilgeMetricChange();
+  document.getElementById('f-bilge-period').value = '1h';
+  document.getElementById('f-bilge-threshold').value = '';
   document.getElementById('f-alarm_type').value = 'warning';
   document.getElementById('f-repeat_mode').value = 'continuous';
   toggleRepeatSeconds();
   document.getElementById('f-repeat_seconds').value = 30;
   document.getElementById('f-publish_to_signalk').checked = false;
+  document.getElementById('f-notify_remote').checked = false;
   document.getElementById('f-enabled').checked = true;
 }
 
@@ -1052,6 +1434,7 @@ function editRule(id) {
   toggleRepeatSeconds();
   document.getElementById('f-repeat_seconds').value = rule.repeat_seconds || 30;
   document.getElementById('f-publish_to_signalk').checked = !!rule.publish_to_signalk;
+  document.getElementById('f-notify_remote').checked = !!rule.notify_remote;
   document.getElementById('f-enabled').checked = !!rule.enabled;
 
   if (rule.kind === 'range') {
@@ -1065,7 +1448,7 @@ function editRule(id) {
     onThresholdModeChange();
     document.getElementById('f-min').value = rule.min != null ? round2(toDisplayValue(rule.min, rule.pgn, rule.field)) : '';
     document.getElementById('f-max').value = rule.max != null ? round2(toDisplayValue(rule.max, rule.pgn, rule.field)) : '';
-  } else {
+  } else if (rule.kind === 'alert_pgn') {
     document.getElementById('f-alertType').value = rule.alertType ?? '';
     document.getElementById('f-alertCategory').value = rule.alertCategory ?? '';
     document.getElementById('f-alertSystem').value = rule.alertSystem ?? '';
@@ -1073,6 +1456,15 @@ function editRule(id) {
     document.getElementById('f-alertId').value = rule.alertId ?? '';
     document.getElementById('f-alert-src').value = rule.src ?? '';
     document.getElementById('f-ignore').checked = !!rule.ignore;
+  } else if (rule.kind === 'bilge') {
+    document.getElementById('f-bilge-channel').value = rule.channel ?? 0;
+    document.getElementById('f-bilge-metric').value = rule.metric || 'count';
+    onBilgeMetricChange();
+    document.getElementById('f-bilge-period').value = rule.period || '1h';
+    /* Stored threshold is cycles (as-is) or seconds (runtime) — display
+     * runtime in minutes, matching the input's own label/unit. */
+    document.getElementById('f-bilge-threshold').value = rule.threshold == null ? ''
+      : (rule.metric === 'runtime' ? round2(rule.threshold / 60) : rule.threshold);
   }
 }
 
@@ -1083,8 +1475,9 @@ async function refresh() {
   tbody.innerHTML = '';
   r.rules.forEach(rule => {
     const tr = document.createElement('tr');
-    tr.innerHTML = \`<td>\${rule.label}</td><td>\${rule.kind}</td><td>\${rule.enabled ? 'yes' : 'no'}</td>
+    tr.innerHTML = \`<td>\${rule.label}</td><td>\${rule.kind}</td><td>\${rule.enabled ? '<span class="pill ok">yes</span>' : '<span class="pill neutral">no</span>'}</td>
       <td>\${rule.alarm_type}</td><td>\${rule.repeat_mode}</td><td>\${rule.publish_to_signalk ? 'yes' : 'no'}</td>
+      <td>\${rule.notify_remote ? 'yes' : 'no'}</td>
       <td><button onclick="editRule('\${rule.id}')">Edit</button> <button onclick="deleteRule('\${rule.id}')">Delete</button></td>\`;
     tbody.appendChild(tr);
   });
@@ -1095,7 +1488,8 @@ async function refresh() {
     const rule = r.rules.find(x => x.id === a.id);
     const tr = document.createElement('tr');
     tr.innerHTML = \`<td>\${rule ? rule.label : a.id}</td><td>\${new Date(a.since).toLocaleTimeString()}</td>
-      <td>\${a.acked ? 'yes' : 'no'}</td><td><button onclick="cancelAlarm('\${a.id}')" \${a.acked ? 'disabled' : ''}>Cancel</button></td>\`;
+      <td>\${a.acked ? '<span class="pill neutral">yes</span>' : '<span class="pill danger">no</span>'}</td>
+      <td><button class="danger" onclick="cancelAlarm('\${a.id}')" \${a.acked ? 'disabled' : ''}>Cancel</button></td>\`;
     activeBody.appendChild(tr);
   });
 
@@ -1105,6 +1499,22 @@ async function refresh() {
   if (!hwDirty) {
     document.getElementById('hw-output').value = r.hardware.output;
     onHwOutputChange();
+    /* Load the "already paired" list the first time we learn the saved
+     * output is bt_speaker — NOT unconditionally, since refresh() itself
+     * runs every 5s and this would otherwise re-query bluetoothctl (and
+     * reset any in-progress "Connecting…" button) on every poll tick.
+     * A manual switch to bt_speaker is handled separately, unconditionally,
+     * by onHwOutputSelect(). */
+    if (r.hardware.output === 'bt_speaker' && !btKnownLoaded) {
+      btKnownLoaded = true;
+      btLoadKnown();
+    }
+  }
+
+  if (!rnDirty && r.remoteNotify) {
+    document.getElementById('rn-enabled').checked = !!r.remoteNotify.enabled;
+    document.getElementById('rn-server').value = r.remoteNotify.ntfyServer || 'https://ntfy.sh';
+    document.getElementById('rn-topic').value = r.remoteNotify.topic || '';
   }
 }
 
@@ -1125,6 +1535,7 @@ async function saveRule() {
     repeat_mode: document.getElementById('f-repeat_mode').value,
     repeat_seconds: parseInt(document.getElementById('f-repeat_seconds').value || '30', 10),
     publish_to_signalk: document.getElementById('f-publish_to_signalk').checked,
+    notify_remote: document.getElementById('f-notify_remote').checked,
   };
   if (kind === 'range') {
     const mode = document.getElementById('f-threshold-mode').value;
@@ -1139,7 +1550,7 @@ async function saveRule() {
       ? toStorageValue(parseFloat(document.getElementById('f-min').value), rule.pgn, rule.field) : null;
     rule.max = (mode === 'max' || mode === 'both') && document.getElementById('f-max').value !== ''
       ? toStorageValue(parseFloat(document.getElementById('f-max').value), rule.pgn, rule.field) : null;
-  } else {
+  } else if (kind === 'alert_pgn') {
     rule.alertType = parseInt(document.getElementById('f-alertType').value, 10);
     rule.alertCategory = parseInt(document.getElementById('f-alertCategory').value, 10);
     rule.alertSystem = parseInt(document.getElementById('f-alertSystem').value || '0', 10);
@@ -1148,6 +1559,15 @@ async function saveRule() {
     rule.src = document.getElementById('f-alert-src').value !== ''
       ? parseInt(document.getElementById('f-alert-src').value, 10) : null;
     rule.ignore = document.getElementById('f-ignore').checked;
+  } else if (kind === 'bilge') {
+    rule.channel = parseInt(document.getElementById('f-bilge-channel').value, 10);
+    rule.metric = document.getElementById('f-bilge-metric').value;
+    rule.period = document.getElementById('f-bilge-period').value;
+    const thresholdVal = document.getElementById('f-bilge-threshold').value;
+    /* Runtime is entered in minutes (matches the input's label) but
+     * stored in seconds, matching bilge.c's on_s_* fields. */
+    rule.threshold = thresholdVal === '' ? null
+      : (rule.metric === 'runtime' ? parseFloat(thresholdVal) * 60 : parseInt(thresholdVal, 10));
   }
   await fetch('/api/alarms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rule) });
   hideAddForm();
@@ -1166,10 +1586,15 @@ function onHwOutputChange() {
 }
 /* Bound to the dropdown itself — marks the selection unsaved so the
  * 5s periodic refresh() doesn't stomp it back to the last-saved value
- * (and hide the Bluetooth panel) before the user gets to use it. */
+ * (and hide the Bluetooth panel) before the user gets to use it. Also
+ * where the "already paired" list gets (re-)loaded — NOT inside
+ * onHwOutputChange(), which refresh() also calls every 5s regardless of
+ * whether anything changed; a live bluetoothctl query on every poll tick
+ * would be wasteful and would reset any in-progress "Connecting…" button. */
 function onHwOutputSelect() {
   hwDirty = true;
   onHwOutputChange();
+  if (document.getElementById('hw-output').value === 'bt_speaker') { btLoadKnown(); }
 }
 async function saveHardware() {
   await fetch('/api/hardware', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1185,27 +1610,151 @@ function hasRealBtName(d) {
   return d.name.replace(/-/g, ':').toUpperCase() !== d.mac.toUpperCase();
 }
 
-async function btScan() {
-  document.getElementById('bt-devices').innerHTML = '<li>Scanning…</li>';
-  const r = await fetch('/api/bt/scan?seconds=8').then(r => r.json());
-  const ul = document.getElementById('bt-devices');
+/* Shared by the "Already paired" list and the scan-results list — both
+ * just need a name/mac and a button that pairs+connects via the same
+ * endpoint (harmless/idempotent on an already-paired device: bluetoothctl
+ * reports "AlreadyExists" for the pair step and moves straight on to
+ * trust+connect). */
+function btDeviceRow(d, btnLabel) {
+  const li = document.createElement('li');
+  li.textContent = \`\${d.name} (\${d.mac}) \`;
+  const btn = document.createElement('button');
+  btn.textContent = btnLabel;
+  const msg = document.createElement('span');
+  msg.style.marginLeft = '0.5em';
+  msg.style.color = 'var(--danger)';
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = 'Connecting…';
+    msg.textContent = '';
+    try {
+      const r = await fetch('/api/bt/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) }).then(r => r.json());
+      btn.textContent = r.connected ? 'Connected' : btnLabel;
+      if (!r.connected) {
+        msg.textContent = 'Failed to connect' + (r.paired ? ' (paired, but connect did not complete — try again)' : '');
+      }
+    } catch (e) {
+      btn.textContent = btnLabel;
+      msg.textContent = 'Error: ' + e.message;
+    }
+    btn.disabled = false;
+    btStatus();
+  };
+  li.appendChild(btn);
+  li.appendChild(msg);
+  return li;
+}
+
+async function btLoadKnown() {
+  const ul = document.getElementById('bt-known');
+  const r = await fetch('/api/bt/known').then(r => r.json());
   ul.innerHTML = '';
-  const devices = [...r.devices].sort((a, b) => hasRealBtName(b) - hasRealBtName(a));
-  devices.forEach(d => {
-    const li = document.createElement('li');
-    li.textContent = \`\${d.name} (\${d.mac}) \`;
-    const btn = document.createElement('button');
-    btn.textContent = 'Pair';
-    btn.onclick = async () => { await fetch('/api/bt/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) }); btStatus(); };
-    li.appendChild(btn);
-    ul.appendChild(li);
-  });
+  if (r.devices.length === 0) {
+    ul.innerHTML = '<li>None yet — scan below to pair a new speaker.</li>';
+    return;
+  }
+  r.devices.forEach(d => ul.appendChild(btDeviceRow(d, 'Connect')));
+}
+
+async function btScan() {
+  const SCAN_SECONDS = 8;
+  const btn = document.getElementById('bt-scan-btn');
+  const ul = document.getElementById('bt-devices');
+  btn.disabled = true;
+  let remaining = SCAN_SECONDS;
+  ul.innerHTML = \`<li>Scanning… (\${remaining}s)</li>\`;
+  /* Purely cosmetic countdown — the fetch below carries the real timing —
+   * but without it the button just sits there for 8+ seconds looking
+   * frozen rather than working. */
+  const tick = setInterval(() => {
+    remaining -= 1;
+    if (remaining > 0) { ul.innerHTML = \`<li>Scanning… (\${remaining}s)</li>\`; }
+  }, 1000);
+
+  let devices = [];
+  try {
+    const r = await fetch(\`/api/bt/scan?seconds=\${SCAN_SECONDS}\`).then(r => r.json());
+    devices = [...r.devices].sort((a, b) => hasRealBtName(b) - hasRealBtName(a));
+  } catch (e) {
+    clearInterval(tick);
+    btn.disabled = false;
+    ul.innerHTML = '<li>Scan failed: ' + e.message + '</li>';
+    return;
+  }
+  clearInterval(tick);
+  btn.disabled = false;
+  ul.innerHTML = '';
+  if (devices.length === 0) {
+    ul.innerHTML = '<li>No devices found. For a speaker, hold its pairing button until the light flashes and try again.</li>';
+    return;
+  }
+  devices.forEach(d => ul.appendChild(btDeviceRow(d, 'Pair')));
+}
+async function btDisconnect() {
+  const btn = document.getElementById('bt-disconnect-btn');
+  btn.disabled = true;
+  await fetch('/api/bt/disconnect', { method: 'POST' });
+  btn.disabled = false;
+  btStatus();
 }
 async function btStatus() {
   const r = await fetch('/api/bt/status').then(r => r.json());
   const label = r.connected ? 'connected' : 'not connected';
   document.getElementById('bt-status').textContent = r.name ? \`\${label} — \${r.name}\` : label;
 }
+/* A guessable topic on the public ntfy.sh server is the whole attack
+ * surface for this feature, so make the safe option the easy one: one
+ * click produces a topic nobody is going to guess. */
+function rnRandomTopic() {
+  const rnd = new Uint8Array(9);
+  crypto.getRandomValues(rnd);
+  const hex = Array.from(rnd).map(b => b.toString(16).padStart(2, '0')).join('');
+  document.getElementById('rn-topic').value = 'sensor-n2k-' + hex;
+  rnDirty = true;
+}
+
+function rnConfigFromForm() {
+  return {
+    enabled: document.getElementById('rn-enabled').checked,
+    ntfyServer: document.getElementById('rn-server').value.trim() || 'https://ntfy.sh',
+    topic: document.getElementById('rn-topic').value.trim(),
+  };
+}
+
+async function rnSave() {
+  const msgEl = document.getElementById('rn-msg');
+  const r = await fetch('/api/remote-notify', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rnConfigFromForm()),
+  }).then(r => r.json());
+  msgEl.style.color = r.ok ? 'var(--ok)' : 'var(--danger)';
+  msgEl.textContent = r.ok ? 'Saved.' : 'Failed: ' + (r.error || 'unknown error');
+  if (r.ok) rnDirty = false;
+  setTimeout(() => { msgEl.textContent = ''; }, 6000);
+}
+
+async function rnTest() {
+  const msgEl = document.getElementById('rn-msg');
+  msgEl.style.color = 'var(--text-dim)';
+  msgEl.textContent = 'Sending…';
+  try {
+    /* Send the form values, not the saved ones, so the button works
+     * before pressing Save — the common case is "type a topic, test it,
+     * then keep it". */
+    const r = await fetch('/api/remote-notify/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rnConfigFromForm()),
+    }).then(r => r.json());
+    msgEl.style.color = r.ok ? 'var(--ok)' : 'var(--danger)';
+    msgEl.textContent = r.ok
+      ? 'Sent — it should arrive on any phone subscribed to that topic.'
+      : 'Failed: ' + (r.error || 'unknown error');
+  } catch (e) {
+    msgEl.style.color = 'var(--danger)';
+    msgEl.textContent = 'Failed: ' + e.message;
+  }
+}
+
 async function btTest() {
   const msgEl = document.getElementById('bt-test-msg');
   msgEl.textContent = 'Playing…';
@@ -1283,16 +1832,19 @@ watchSensorConfig();
 
 syncBtReconnectMonitor();
 
-/* One-time boot announcement ("uno q n2k", at buzzer-tier volume — the
- * quietest of the four levels, appropriate for a routine "I'm up" ping
- * rather than an actual alarm), once a Bluetooth speaker is configured
- * AND actually reachable (findBluezSinkTarget() checks for a real
- * PipeWire sink, not just BlueZ "paired" — see its comment for why that
- * distinction matters on this board). Polls because the sink can take a
- * few seconds to appear after this service starts; gives up quietly
- * after BOOT_ANNOUNCE_TIMEOUT_MS if one never does (no speaker
- * configured, or it's not in range yet — not an error). Runs once per
- * service start, not on every reconnect. */
+/* One-time boot announcement — a chime ("uno q n2k", at buzzer-tier
+ * volume, the quietest of the four levels, appropriate for a routine
+ * "I'm up" ping rather than an actual alarm) immediately followed by the
+ * current network address, once a Bluetooth speaker is configured AND
+ * actually reachable (findBluezSinkTarget() checks for a real PipeWire
+ * sink, not just BlueZ "paired" — see its comment for why that
+ * distinction matters on this board). The IP half is what makes this
+ * board findable on a new network with zero prior network access — see
+ * announceIpAddress() above. Polls because the sink can take a few
+ * seconds to appear after this service starts; gives up quietly after
+ * BOOT_ANNOUNCE_TIMEOUT_MS if one never does (no speaker configured, or
+ * it's not in range yet — not an error). Runs once per service start,
+ * not on every reconnect. */
 const BOOT_ANNOUNCE_POLL_MS = 4000;
 const BOOT_ANNOUNCE_TIMEOUT_MS = 90000;
 
@@ -1307,6 +1859,9 @@ function announceBootWhenReady() {
     if (target) {
       const ok = await bt.playAlert('uno q n2k', mac, 'buzzer');
       if (!ok) console.error('[ALARM] boot announcement: playback failed');
+      /* Same "sink is ready" moment covers the IP too — no separate
+       * poll loop needed. */
+      await announceIpAddress();
       return;
     }
     if (Date.now() < deadline) {
