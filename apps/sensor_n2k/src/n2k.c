@@ -168,6 +168,35 @@ static const uint64_t g_name = N2K_NAME;
 static const struct device *s_can;
 
 /*
+ * Set once the claimed SA has actually been ACKed on the wire by the CAN
+ * hardware. On a bus with no other node present, ACK can never arrive (CAN
+ * requires at least one other transceiver to assert it) — that is a normal,
+ * expected condition (bench test, boat wiring not yet connected), not a
+ * fault. n2k_negotiate_address() stops waiting for it after a bounded
+ * number of attempts and lets the rest of the system start up regardless;
+ * mgmt_fn() then periodically retries in the background (see
+ * N2K_CLAIM_RECHECK_INTERVAL_MS) so the claim gets properly confirmed the
+ * moment a real device shows up on the bus.
+ */
+static volatile bool s_claim_confirmed;
+
+/*
+ * How many consecutive no-ACK claim attempts to make at startup before
+ * giving up on hardware confirmation and letting the rest of the system
+ * (sensor threads, SPI bridge RX) start anyway. At ~1.25 s/attempt this is
+ * roughly a 6 s startup delay on an empty bus — long enough to rule out a
+ * transient bus-busy condition, short enough not to hang the device.
+ */
+#define N2K_CLAIM_MAX_UNCONFIRMED_ATTEMPTS  5
+
+/*
+ * Once running unconfirmed, how often mgmt_fn() retries the claim in the
+ * background so a device that appears later on the bus gets a proper,
+ * ACKed claim without needing a reboot.
+ */
+#define N2K_CLAIM_RECHECK_INTERVAL_MS       30000
+
+/*
  * PDU1 CAN ID (PF < 240, addressed frame): PS byte carries destination.
  * Used for PGN 59904 and PGN 60928, both of which are PDU1 PGNs.
  */
@@ -395,9 +424,15 @@ static void product_info_send(void)
 	LOG_INF("N2K: sent PGN 126996 product info (%u frames)", fn);
 }
 
+static void claim_recheck(void);
+
 /*
  * Background thread: responds to ISO Requests (PGN 59904) and handles
- * address conflicts that arise after the startup claim window.
+ * address conflicts that arise after the startup claim window. Also, while
+ * the startup claim never got ACKed (empty bus — see n2k_negotiate_address()
+ * and N2K_CLAIM_MAX_UNCONFIRMED_ATTEMPTS), periodically re-attempts the
+ * claim so a device that shows up later on the bus gets a proper ACKed
+ * claim without needing a reboot.
  */
 static void mgmt_fn(void *a, void *b, void *c)
 {
@@ -405,7 +440,17 @@ static void mgmt_fn(void *a, void *b, void *c)
 	struct can_frame rx;
 
 	while (1) {
-		k_msgq_get(&n2k_mgmt_q, &rx, K_FOREVER);
+		k_timeout_t wait = s_claim_confirmed
+			? K_FOREVER
+			: K_MSEC(N2K_CLAIM_RECHECK_INTERVAL_MS);
+
+		if (k_msgq_get(&n2k_mgmt_q, &rx, wait) != 0) {
+			/* Timed out — only possible while unconfirmed. Bus was
+			 * silent for the whole interval; try the claim again in
+			 * case a device has appeared since. */
+			claim_recheck();
+			continue;
+		}
 		LED4B_BLINK(1);   /* any mgmt frame (PGN 60928 or 59904) received */
 
 		/* claim_filt/req_filt sit at lower filter indices than the
@@ -492,6 +537,49 @@ static void busoff_recover(uint32_t recovery_ms)
 		cs, err_cnt.tx_err_cnt, err_cnt.rx_err_cnt);
 }
 
+/*
+ * Single lightweight re-claim attempt, called from mgmt_fn() every
+ * N2K_CLAIM_RECHECK_INTERVAL_MS while s_claim_confirmed is false. Unlike
+ * n2k_negotiate_address()'s startup loop this doesn't run the 250 ms
+ * conflict window or walk to a new SA on failure — the SA was already
+ * uncontested at startup, so this only needs to find out whether the wire
+ * will finally ACK it (i.e. whether a real device has appeared).
+ */
+static void claim_recheck(void)
+{
+	if (g_sa >= N2K_ADDR_NULL) {
+		return;   /* nothing to (re)claim */
+	}
+
+	/*
+	 * This device is alone on the bus, so every claim attempt fails to
+	 * get an ACK. Confirmed on-device: unlike an actively-transmitting
+	 * node, that failed frame does NOT free the M_CAN TX mailbox on its
+	 * own afterwards — without this recovery call, claim_send() below
+	 * fails immediately with -EAGAIN (no free mailbox) on every single
+	 * subsequent periodic attempt, forever, and the claim can never
+	 * actually get back onto the wire even after a real device shows up.
+	 * busoff_recover() clears that out (same stop/start or bus-off
+	 * recovery n2k_negotiate_address() already does at startup) before
+	 * every attempt. Its own "recovery complete" log line is what gives
+	 * visibility into these periodic retries — no separate log needed.
+	 */
+	busoff_recover(2000);
+
+	int err = claim_send();
+	if (err != 0) {
+		return;   /* try again next interval */
+	}
+
+	int tx_result = k_sem_take(&claim_tx_sem, K_MSEC(1000));
+	if (tx_result == 0 && claim_tx_err == 0) {
+		LOG_INF("N2K: address claim confirmed on live bus, SA=0x%02X", g_sa);
+		s_claim_confirmed = true;
+	}
+	/* Any other outcome: still no other device out there — the next
+	 * claim_recheck() will recover and retry. */
+}
+
 int n2k_negotiate_address(const struct device *can_dev)
 {
 	s_can = can_dev;
@@ -507,6 +595,8 @@ int n2k_negotiate_address(const struct device *can_dev)
 		LOG_ERR("N2K: filter add failed (%d, %d)", fid1, fid2);
 		return (fid1 < 0) ? fid1 : fid2;
 	}
+
+	uint8_t unconfirmed_attempts = 0;
 
 	/* Claim loop: try successive addresses until one sticks. */
 	for (;;) {
@@ -575,6 +665,10 @@ int n2k_negotiate_address(const struct device *can_dev)
 		}
 
 		if (conflict) {
+			/* A real device just answered — the bus is populated.
+			 * Give the fresh SA a full set of unconfirmed attempts
+			 * of its own rather than inheriting the old SA's count. */
+			unconfirmed_attempts = 0;
 			continue;   /* retry with the new g_sa */
 		}
 
@@ -591,6 +685,14 @@ int n2k_negotiate_address(const struct device *can_dev)
 		 *   TX error only   → retry same SA (transient ACK failure).
 		 *   TX never done   → bus healthy but still busy; re-queue and
 		 *                     wait once more before giving up.
+		 *
+		 * On a bus with no other device present, none of the above ever
+		 * succeeds — a CAN frame can't be ACKed without another
+		 * transceiver on the wire to assert the ACK bit. That's a normal
+		 * condition (bench test, boat wiring not yet connected), not a
+		 * fault, so after N2K_CLAIM_MAX_UNCONFIRMED_ATTEMPTS we stop
+		 * blocking startup on it and let the caller proceed with the SA
+		 * unconfirmed. mgmt_fn() then keeps retrying in the background.
 		 */
 		{
 			int tx_result = k_sem_take(&claim_tx_sem, K_MSEC(1000));
@@ -600,34 +702,43 @@ int n2k_negotiate_address(const struct device *can_dev)
 			if (tx_result == 0 && claim_tx_err == 0) {
 				/* TX confirmed on wire — address claimed. */
 				LOG_INF("N2K: address claimed SA=0x%02X", g_sa);
+				s_claim_confirmed = true;
 				break;
 			}
 
 			if (cs == CAN_STATE_BUS_OFF) {
 				LOG_WRN("N2K: bus-off after claim window "
-					"(tx=%d err=%d); recovering SA=0x%02X",
+					"(tx=%d err=%d); SA=0x%02X",
 					tx_result, claim_tx_err, g_sa);
 				busoff_recover(2000);
 				k_sleep(K_MSEC(50));
-				continue;
-			}
-
-			if (tx_result == 0 && claim_tx_err != 0) {
+			} else if (tx_result == 0 && claim_tx_err != 0) {
 				/* Callback fired but reported an error; bus is OK. */
-				LOG_WRN("N2K: claim TX error %d (state=%d); retrying SA=0x%02X",
+				LOG_WRN("N2K: claim TX error %d (state=%d); SA=0x%02X",
 					claim_tx_err, cs, g_sa);
-				continue;
+			} else {
+				/*
+				 * tx_result != 0: callback never fired in 1250 ms.
+				 * The frame is auto-retransmitting; adding another
+				 * frame would jam all three TX mailbox slots.
+				 * Recover instead of piling on.
+				 */
+				LOG_WRN("N2K: claim TX timeout 1.25s "
+					"(state=%d); SA=0x%02X", cs, g_sa);
+				busoff_recover(2000);
 			}
 
-			/*
-			 * tx_result != 0: callback never fired in 1250 ms.
-			 * The frame is auto-retransmitting; adding another frame
-			 * would jam all three TX mailbox slots. Recover instead
-			 * and let the outer loop issue a fresh single claim.
-			 */
-			LOG_WRN("N2K: claim TX timeout 1.25s "
-				"(state=%d); recovering SA=0x%02X", cs, g_sa);
-			busoff_recover(2000);
+			if (++unconfirmed_attempts >= N2K_CLAIM_MAX_UNCONFIRMED_ATTEMPTS) {
+				LOG_WRN("N2K: no ACK after %u attempts — bus appears "
+					"empty (no other N2K devices). Proceeding with "
+					"SA=0x%02X unconfirmed; will keep retrying in the "
+					"background every %d s until a real device answers.",
+					unconfirmed_attempts, g_sa,
+					N2K_CLAIM_RECHECK_INTERVAL_MS / 1000);
+				s_claim_confirmed = false;
+				break;
+			}
+
 			continue;
 		}
 	}
@@ -648,6 +759,11 @@ int n2k_negotiate_address(const struct device *can_dev)
 uint8_t n2k_sa_get(void)
 {
 	return g_sa;
+}
+
+bool n2k_sa_confirmed(void)
+{
+	return s_claim_confirmed;
 }
 
 void n2k_send_iso_request(uint32_t requested_pgn)
@@ -748,9 +864,15 @@ int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
 		 * PGN 130311 – Environmental Parameters (8 bytes, no instance field):
 		 *   Byte 0:   SID
 		 *   Byte 1:   bits[5:0]=Temperature Source, bits[7:6]=Humidity Source(N/A=3)
-		 *   Bytes 2-3: Temperature uint16 LE, 0.01 K/bit
-		 *   Bytes 4-5: Humidity uint16 LE, N/A=0xFFFF
-		 *   Bytes 6-7: Atmospheric Pressure uint16 LE, N/A=0xFFFF
+		 *   Bytes 2-3: Temperature uint16 LE, 0.01 K/bit (unsigned, N/A=0xFFFF)
+		 *   Bytes 4-5: Humidity int16 LE — SIGNED (canboat.json:
+		 *              Signed=true, UnknownValue=0x7FFF), N/A=0x7FFF not
+		 *              0xFFFF. Same signed-N/A mistake as % Engine
+		 *              Load/Torque/Alternator Potential/Fuel Rate in
+		 *              N2K_PGNCFG_ENGINE_DYN above — 0xFFFF here would
+		 *              decode as a real (bogus) -0.01% humidity reading,
+		 *              not "not available".
+		 *   Bytes 6-7: Atmospheric Pressure uint16 LE (unsigned, N/A=0xFFFF)
 		 */
 		if (temp_k > 655.35f) { temp_k = 655.35f; }
 		uint16_t raw = (uint16_t)(temp_k * 100.0f);
@@ -759,8 +881,8 @@ int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
 		f->data[1] = (uint8_t)((3U << 6) | (source & 0x3FU));  /* humidity src N/A */
 		f->data[2] = raw        & 0xFFU;
 		f->data[3] = (raw >> 8) & 0xFFU;
-		f->data[4] = 0xFFU;   /* humidity N/A */
-		f->data[5] = 0xFFU;
+		f->data[4] = 0xFFU;   /* humidity N/A, signed lo byte */
+		f->data[5] = 0x7FU;   /* humidity N/A, signed hi byte */
 		f->data[6] = 0xFFU;   /* pressure N/A */
 		f->data[7] = 0xFFU;
 		return 1;
@@ -779,6 +901,45 @@ int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
 		payload[0]  = instance;                  /* Engine Instance */
 		payload[24] = 0x7F;                      /* % Engine Load N/A */
 		payload[25] = 0x7F;                      /* % Engine Torque N/A */
+
+		/*
+		 * Alternator Potential (bytes 7-8) and Fuel Rate (bytes 9-10) are
+		 * SIGNED 16-bit NUMBER fields — confirmed against canboat.json:
+		 * both have Signed=true, UnknownValue=0x7FFF (32767), NOT 0xFFFF.
+		 * The blanket 0xFF fill leaves them at 0xFFFF, which as a signed
+		 * 16-bit value is -1 (i.e. -0.01 V / -0.1 L/h after resolution
+		 * scaling) — a real, if nonsensical, negative reading, not "not
+		 * available". canboatjs parses it as exactly that, so Signal K
+		 * shows a bogus alternator voltage and fuel rate instead of
+		 * nothing. Only the high byte needs correcting to 0x7F; the low
+		 * byte (0xFF) is shared between both sentinel patterns. Same
+		 * signed-N/A class of bug as % Engine Load/Torque above — those
+		 * two were already handled correctly, these two were missed.
+		 */
+		payload[8]  = 0x7F;                      /* Alternator Potential N/A (signed hi byte) */
+		payload[10] = 0x7F;                      /* Fuel Rate N/A (signed hi byte) */
+
+		/*
+		 * Discrete Status 1/2 (bytes 20-21, 22-23) are BITLOOKUP fields —
+		 * each of the 16 bits is an independently-named fault flag (Check
+		 * Engine, Over Temperature, Low Oil Pressure, ...; confirmed
+		 * against canboat's own PGN definition, docs/canboat.json,
+		 * LookupBitEnumeration ENGINE_STATUS_1/2 — every bit is assigned,
+		 * there is no reserved "N/A" pattern the way plain NUMBER fields
+		 * use 0xFFFF/0x7FFF). Leaving these in the blanket 0xFF fill above
+		 * sets every bit — i.e. reports all 16 fault conditions on both
+		 * status words as simultaneously active. Confirmed on-device: a
+		 * real Signal K instance showed a full page of engine alarm
+		 * notifications (Check Engine, Over Temperature, Low Oil
+		 * Pressure, ...) that were entirely artifacts of this, not real
+		 * conditions. 0x00 (no bits set) is the correct "no fault
+		 * reported" value for a device — like this one — that has no
+		 * actual engine fault sensors to report from.
+		 */
+		payload[20] = 0x00;                      /* Discrete Status 1 lo */
+		payload[21] = 0x00;                      /* Discrete Status 1 hi */
+		payload[22] = 0x00;                      /* Discrete Status 2 lo */
+		payload[23] = 0x00;                      /* Discrete Status 2 hi */
 
 		if (source == 0U) {
 			/* Oil Temperature: bytes 3-4, resolution 0.1 K/bit */
@@ -833,8 +994,18 @@ int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
 		 * Byte 1:   Transmission Gear (2-bit N/A=3) | Reserved (6-bit) = 0xFF
 		 * Bytes 2-3: Oil Pressure uint16 LE, 100 Pa/bit — N/A = 0xFFFF
 		 * Bytes 4-5: Oil Temperature uint16 LE, 0.1 K/bit
-		 * Byte 6:   Discrete Status 1 — N/A = 0xFF
-		 * Byte 7:   pad 0xFF
+		 * Byte 6:   Discrete Status 1 — BITLOOKUP, no N/A pattern; 0x00
+		 *           (no bits set = no fault reported), NOT 0xFF — see
+		 *           the identical fix/comment in N2K_PGNCFG_ENGINE_DYN
+		 *           above for why (confirmed against canboat's own PGN
+		 *           definition; this byte was previously mislabeled
+		 *           "N/A = 0xFF" here, which actually means all 5 named
+		 *           transmission faults — Check Transmission, Over
+		 *           Temperature, Low Oil Pressure, Low Oil Level, Sail
+		 *           Drive — reporting simultaneously active).
+		 * Byte 7:   pad 0xFF (this one genuinely is RESERVED per the
+		 *           PGN definition, not a lookup/bitfield — 0xFF is
+		 *           correct here)
 		 */
 		uint16_t raw = (uint16_t)(temp_k * 10.0f);
 		f->id      = n2k_can_id(N2K_PGN_TRANS_DYN, N2K_PRIORITY, sa);
@@ -844,7 +1015,7 @@ int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
 		f->data[3] = 0xFFU;
 		f->data[4] = raw        & 0xFFU;
 		f->data[5] = (raw >> 8) & 0xFFU;
-		f->data[6] = 0xFFU;          /* discrete status N/A */
+		f->data[6] = 0x00U;          /* discrete status 1 — no faults */
 		f->data[7] = 0xFFU;
 		return 1;
 	}

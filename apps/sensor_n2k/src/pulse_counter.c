@@ -110,9 +110,13 @@ static void pc_publish(uint8_t idx)
         f.data[0] = cfg->engine_instance;
         f.data[1] = raw & 0xFFU;     /* Engine Speed LSB */
         f.data[2] = (raw >> 8) & 0xFFU;
-        f.data[3] = 0xFF;            /* Boost Pressure N/A */
+        f.data[3] = 0xFF;            /* Boost Pressure N/A (unsigned, 0xFFFF) */
         f.data[4] = 0xFF;
-        f.data[5] = 0xFF;            /* Tilt/Trim N/A */
+        /* Tilt/Trim is a SIGNED 8-bit field (canboat.json: Signed=true,
+         * UnknownValue=0x7F) — 0xFF here would decode as -1%, a real
+         * (bogus) value, not "not available". Same signed-N/A class of
+         * bug as n2k.c's engine/humidity fields. */
+        f.data[5] = 0x7F;            /* Tilt/Trim N/A (signed) */
         f.data[6] = 0xFF;
         f.data[7] = 0xFF;
 

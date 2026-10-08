@@ -279,8 +279,13 @@ static void bridge_thread(void *a, void *b, void *c)
  *
  * Frame data layout:
  *   [0] 0x44 ('D') — diagnostic magic
- *   [1] CAN state  (0=active 1=warning 2=passive 3=bus_off 4=stopped)
- *   [2] Claimed SA (0xFE = not yet claimed)
+ *   [1] bits[2:0] CAN state (0=active 1=warning 2=passive 3=bus_off 4=stopped)
+ *       bit[7]    address claim confirmed — set once [2]'s SA has actually
+ *                 been ACKed by another device (see n2k_sa_confirmed()).
+ *                 Clear means [2] is what we're transmitting as, but no
+ *                 other node has acknowledged it yet (e.g. empty bus).
+ *   [2] Claimed SA (0xFE = not yet claimed; see bit[7] of [1] above for
+ *       whether this SA is actually confirmed on the wire)
  *   [3] Uptime seconds, low byte
  *   [4] Uptime seconds, high byte
  *   [5]   RX frame count low byte (frames received from bus via FDCAN1)
@@ -326,7 +331,11 @@ static void diag_thread(void *a, void *b, void *c)
 		f.flags   = CAN_FRAME_IDE;
 		f.dlc     = 8;
 		f.data[0] = 0x44U;
-		f.data[1] = (uint8_t)cs;
+		/* bit 7: address claim confirmed (ACKed by another device on the
+		 * bus) — see n2k_sa_confirmed(). cs itself only ever needs the
+		 * low 3 bits (enum can_state has a handful of values), so this
+		 * bit is free without changing the frame layout. */
+		f.data[1] = (uint8_t)cs | (n2k_sa_confirmed() ? 0x80U : 0x00U);
 		f.data[2] = n2k_sa_get();
 		f.data[3] = (uint8_t)(up_s & 0xFFU);
 		f.data[4] = (uint8_t)((up_s >> 8) & 0xFFU);

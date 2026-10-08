@@ -181,6 +181,17 @@ int n2k_negotiate_address(const struct device *can_dev);
 uint8_t n2k_sa_get(void);
 
 /**
+ * Return true only if n2k_sa_get()'s SA has actually been ACKed on the wire
+ * by another device. On a bus with no other node present, n2k_negotiate_address()
+ * still returns success with an SA assigned (see N2K_CLAIM_MAX_UNCONFIRMED_ATTEMPTS
+ * in n2k.c) so the rest of the system can start up, but that SA is *unconfirmed*
+ * until a real device answers — this distinguishes the two for callers (e.g. the
+ * SPI bridge diagnostic frame / bus-monitor UI) that shouldn't report it as a
+ * solid claim.
+ */
+bool n2k_sa_confirmed(void);
+
+/**
  * Broadcast an ISO Request (PGN 59904, global destination) for the given
  * PGN. Standard ISO 11783 / N2K mechanism for soliciting a response from
  * any device on the bus, including ones that only transmit at their own
