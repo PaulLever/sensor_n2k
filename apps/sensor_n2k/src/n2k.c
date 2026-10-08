@@ -853,3 +853,30 @@ int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
 		return 0;
 	}
 }
+
+int n2k_build_switch_frame(uint8_t instance, const uint8_t states[4],
+                            struct can_frame *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->flags = CAN_FRAME_IDE;
+	out->dlc   = 8;
+	out->id    = n2k_can_id(N2K_PGN_BINARY_SWITCH_STATUS, N2K_PRIORITY, n2k_sa_get());
+	out->data[0] = instance;
+
+	/* Byte 1 = indicators 1-4 (this device's 4 channels), 2 bits each:
+	 * 0=Off 1=On 2=Error 3=Unavailable (BINARY_STATUS lookup). */
+	uint8_t b1 = 0;
+	for (int i = 0; i < 4; i++) {
+		uint8_t v = states[i] ? 1U : 0U;
+		b1 |= (uint8_t)((v & 0x3U) << (i * 2));
+	}
+	out->data[1] = b1;
+
+	/* Bytes 2-7 = indicators 5-28 — this device doesn't own those
+	 * channels, report Unavailable (0b11 repeating = 0xFF). */
+	for (int i = 2; i < 8; i++) {
+		out->data[i] = 0xFFU;
+	}
+
+	return 0;
+}

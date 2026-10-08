@@ -36,22 +36,55 @@
 		pc1_gpios = <&gpiob 1 (GPIO_ACTIVE_HIGH | GPIO_PULL_DOWN)>;
 
 		/*
+		 * Bilge pump monitor inputs — 4-channel PC817 opto-isolator
+		 * board, LED side driven from each pump's 12V running line
+		 * (through a series resistor), phototransistor side pulling
+		 * one of these 3.3V pins. Pump running -> LED lit ->
+		 * phototransistor conducts -> pin pulled LOW, so
+		 * ACTIVE_LOW+PULL_UP (same convention as pc0_gpios above,
+		 * same electrical situation: an external open-collector-ish
+		 * output pulling a normally-pulled-up input).
+		 *   bilge0 — D2  / PB3
+		 *   bilge1 — D7  / PB2
+		 *   bilge2 — D11 / PB15
+		 *   bilge3 — D12 / PB14
+		 * All four confirmed free on this board (not claimed by
+		 * 1-Wire/ADC/pulse-counters/FDCAN/USART1/USB OTG pins).
+		 */
+		bilge0_gpios = <&gpiob 3  (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		bilge1_gpios = <&gpiob 2  (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		bilge2_gpios = <&gpiob 15 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		bilge3_gpios = <&gpiob 14 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+
+		/*
 		 * Alarm buzzer/LED/cancel-button — PLACEHOLDER pins pending real
 		 * wiring confirmation (physical bring-up is not part of initial
 		 * alarm-feature testing; Bluetooth speaker output is tested
 		 * first). GPIOF was the original plan but has no devicetree node
 		 * in Zephyr's STM32U5 support at all — see alarm_io.h for the
 		 * full explanation. Using GPIOH instead: already enabled below,
-		 * PH0-PH2 aren't claimed by anything else on this board (PH10-15
-		 * are the on-board status LEDs in arduino_uno_q-common.dtsi).
+		 * PH10-15 are the on-board status LEDs in arduino_uno_q-common.dtsi.
 		 * This block is shared with the MCP2515 overlay variant too —
 		 * EXTRA_DTC_OVERLAY_FILE in CMakeLists.txt merges onto this same
 		 * zephyr_user node rather than replacing it, so no duplicate
 		 * block is needed in arduino_uno_q_mcp2515.overlay.
+		 *
+		 * alarm_button is interrupt-driven, so its pin *number* (not just
+		 * port) must not collide with any other interrupt-driven input's
+		 * pin number: STM32 EXTI lines are numbered by pin number and
+		 * shared across all ports (only one port can own EXTI-line-N's
+		 * callback at a time — the second gpio_pin_interrupt_configure()
+		 * call for that line silently gets -EBUSY and is never armed,
+		 * both call sites here ignore the return value). Pin numbers 0-3
+		 * and 14-15 are already claimed by pc0/pc1/bilge0-3 above, so
+		 * this must stay off those — PH4 is free. (Originally PH2, which
+		 * collided with bilge1_gpios's PB2 and silently broke bilge
+		 * channel 1's interrupt — button was never wired up yet so the
+		 * conflict went unnoticed until bilge1 testing surfaced it.)
 		 */
 		alarm_buzzer_gpios = <&gpioh 0 GPIO_ACTIVE_HIGH>;
 		alarm_led_gpios    = <&gpioh 1 GPIO_ACTIVE_HIGH>;
-		alarm_button_gpios = <&gpioh 2 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		alarm_button_gpios = <&gpioh 4 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 	};
 
 	/*

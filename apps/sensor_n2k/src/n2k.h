@@ -20,6 +20,7 @@
 
 #define N2K_PGN_TEMP          130312UL  /* Temperature (8 bytes, single frame) */
 #define N2K_PGN_ENV_PARAMS    130311UL  /* Environmental Parameters (8 bytes, single frame) */
+#define N2K_PGN_BINARY_SWITCH_STATUS 127501UL  /* Binary Switch Bank Status (8 bytes, single frame) */
 
 /*
  * PGN 130316 – Temperature, Extended Range (single frame, up to ~16 500 °C).
@@ -85,6 +86,20 @@ int n2k_send_frame(const struct can_frame *frame);
  */
 int n2k_build_temp_frames(uint8_t pgn_id, uint8_t instance, uint8_t source,
                            float temp_k, struct can_frame out[N2K_TEMP_MAX_FRAMES]);
+
+/**
+ * Build a single CAN frame for PGN 127501 – Binary Switch Bank Status.
+ * Reports up to 4 indicators (indicators 1-4 of the 28 the PGN supports);
+ * the remaining 24 are always reported as 3 (Unavailable) since this
+ * device doesn't own those channels.
+ *
+ * @param instance  Switch bank instance number
+ * @param states    4 channel states: 0 = off, 1 = on
+ * @param out       Single can_frame to fill in
+ * @return          0 on success
+ */
+int n2k_build_switch_frame(uint8_t instance, const uint8_t states[4],
+                            struct can_frame *out);
 
 /* ------------------------------------------------------------------ */
 /* ISO 11783-5 address management                                       */

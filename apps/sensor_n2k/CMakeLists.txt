@@ -29,4 +29,5 @@ target_sources(app PRIVATE
     src/sensor_config.c
     src/pulse_counter.c
     src/alarm_io.c
+    src/bilge.c
 )

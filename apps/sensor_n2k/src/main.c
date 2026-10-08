@@ -1,4 +1,5 @@
 #include "adc.h"
+#include "bilge.h"
 #include "n2k.h"
 #include "onewire.h"
 #include "pulse_counter.h"
@@ -387,6 +388,8 @@ int main(void)
 	k_thread_name_set(&ow_thread_data, "1wire");
 
 	pulse_counter_init(can_dev);   /* starts thread only if a counter is enabled */
+
+	bilge_init(can_dev);
 
 	return 0;
 }
